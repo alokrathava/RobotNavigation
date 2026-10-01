@@ -1,0 +1,148 @@
+import os
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+from launch_ros.descriptions import ParameterFile
+
+
+def generate_launch_description():
+    nav_share = get_package_share_directory('robot_navigation')
+    bringup_share = get_package_share_directory('robot_bringup')
+
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    use_rviz = LaunchConfiguration('rviz')
+    map_file = LaunchConfiguration('map')
+    amcl_params = LaunchConfiguration('amcl_params_file')
+    nav2_params = ParameterFile(
+        LaunchConfiguration('nav2_params_file'), allow_substs=True
+    )
+
+    sim = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(bringup_share, 'launch', 'sim.launch.py')
+        ),
+        launch_arguments={'use_sim_time': use_sim_time, 'rviz': 'false'}.items(),
+    )
+
+    # --- localization: map_server + amcl (map -> odom) ---
+    map_server = Node(
+        package='nav2_map_server',
+        executable='map_server',
+        name='map_server',
+        output='screen',
+        parameters=[amcl_params, {'yaml_filename': map_file}],
+    )
+    amcl = Node(
+        package='nav2_amcl',
+        executable='amcl',
+        name='amcl',
+        output='screen',
+        parameters=[amcl_params],
+    )
+    lifecycle_localization = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_localization',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'autostart': True,
+            'node_names': ['map_server', 'amcl'],
+        }],
+    )
+
+    # --- navigation: controller/planner/behaviors/bt_navigator ---
+    # Controller and behaviors publish /cmd_vel_nav; the velocity smoother
+    # produces the final /cmd_vel consumed by the Gazebo bridge.
+    to_nav = [('cmd_vel', 'cmd_vel_nav')]
+    controller = Node(
+        package='nav2_controller', executable='controller_server',
+        name='controller_server', output='screen',
+        parameters=[nav2_params], remappings=to_nav,
+    )
+    planner = Node(
+        package='nav2_planner', executable='planner_server',
+        name='planner_server', output='screen',
+        parameters=[nav2_params],
+    )
+    behaviors = Node(
+        package='nav2_behaviors', executable='behavior_server',
+        name='behavior_server', output='screen',
+        parameters=[nav2_params], remappings=to_nav,
+    )
+    bt_navigator = Node(
+        package='nav2_bt_navigator', executable='bt_navigator',
+        name='bt_navigator', output='screen',
+        parameters=[nav2_params],
+    )
+    smoother = Node(
+        package='nav2_velocity_smoother', executable='velocity_smoother',
+        name='velocity_smoother', output='screen',
+        parameters=[nav2_params],
+        remappings=to_nav + [('cmd_vel_smoothed', 'cmd_vel')],
+    )
+    lifecycle_navigation = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_navigation',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'autostart': True,
+            'node_names': [
+                'controller_server', 'planner_server', 'behavior_server',
+                'velocity_smoother', 'bt_navigator',
+            ],
+        }],
+    )
+
+    rviz = Node(
+        package='rviz2',
+        executable='rviz2',
+        arguments=['-d', os.path.join(nav_share, 'rviz', 'navigation.rviz')],
+        parameters=[{'use_sim_time': use_sim_time}],
+        condition=IfCondition(use_rviz),
+        output='screen',
+    )
+
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            'use_sim_time', default_value='true',
+            description='Use simulation (Gazebo) clock if true',
+        ),
+        DeclareLaunchArgument(
+            'rviz', default_value='true',
+            description='Launch RViz with the navigation view',
+        ),
+        DeclareLaunchArgument(
+            'map',
+            default_value=os.path.join(nav_share, 'maps', 'main_floor.yaml'),
+            description='Saved map yaml',
+        ),
+        DeclareLaunchArgument(
+            'amcl_params_file',
+            default_value=os.path.join(nav_share, 'config', 'amcl.yaml'),
+            description='map_server + AMCL parameters file',
+        ),
+        DeclareLaunchArgument(
+            'nav2_params_file',
+            default_value=os.path.join(nav_share, 'config', 'nav2_params.yaml'),
+            description='Nav2 navigation parameters file',
+        ),
+        sim,
+        map_server,
+        amcl,
+        lifecycle_localization,
+        controller,
+        planner,
+        behaviors,
+        bt_navigator,
+        smoother,
+        lifecycle_navigation,
+        rviz,
+    ])
