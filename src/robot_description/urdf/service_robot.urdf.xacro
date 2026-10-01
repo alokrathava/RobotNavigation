@@ -1,0 +1,83 @@
+<?xml version="1.0"?>
+<robot name="service_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:arg name="namespace" default=""/>
+  <xacro:property name="ns" value="$(arg namespace)"/>
+
+  <xacro:include filename="$(find robot_description)/urdf/inertial_macros.xacro"/>
+
+  <!-- ===================== Shared dimensions ===================== -->
+  <!-- Wheels / base -->
+  <xacro:property name="wheel_radius" value="0.075"/>
+  <xacro:property name="wheel_width" value="0.04"/>
+  <xacro:property name="wheel_separation" value="0.40"/>
+  <xacro:property name="wheel_mass" value="1.5"/>
+
+  <xacro:property name="caster_radius" value="0.03"/>
+  <xacro:property name="caster_x" value="0.17"/>
+  <xacro:property name="caster_mass" value="0.3"/>
+
+  <xacro:property name="base_ring_radius" value="0.24"/>
+  <xacro:property name="base_ring_height" value="0.145"/>
+  <xacro:property name="base_ring_mass" value="30.0"/>
+
+  <xacro:property name="slot_radius" value="0.08"/>
+  <xacro:property name="slot_height" value="0.06"/>
+
+  <!-- Lower body (skirt) -->
+  <xacro:property name="skirt_height" value="0.44"/>
+  <xacro:property name="skirt_r_bottom" value="0.225"/>
+  <xacro:property name="skirt_r_mid" value="0.19"/>
+  <xacro:property name="skirt_r_top" value="0.15"/>
+  <xacro:property name="skirt_mass" value="6.0"/>
+
+  <!-- Torso -->
+  <xacro:property name="torso_x" value="0.26"/>
+  <xacro:property name="torso_y" value="0.36"/>
+  <xacro:property name="torso_z" value="0.30"/>
+  <xacro:property name="torso_mass" value="6.0"/>
+  <xacro:property name="shoulder_radius" value="0.07"/>
+
+  <!-- Neck / head -->
+  <xacro:property name="neck_radius" value="0.05"/>
+  <xacro:property name="neck_height" value="0.05"/>
+  <xacro:property name="neck_mass" value="0.5"/>
+
+  <xacro:property name="head_x" value="0.26"/>
+  <xacro:property name="head_y" value="0.36"/>
+  <xacro:property name="head_z" value="0.27"/>
+  <xacro:property name="head_mass" value="3.5"/>
+
+  <!-- Arms -->
+  <xacro:property name="upper_arm_radius" value="0.045"/>
+  <xacro:property name="upper_arm_length" value="0.25"/>
+  <xacro:property name="upper_arm_mass" value="1.2"/>
+  <xacro:property name="forearm_radius" value="0.04"/>
+  <xacro:property name="forearm_length" value="0.22"/>
+  <xacro:property name="forearm_mass" value="0.8"/>
+  <xacro:property name="hand_x" value="0.05"/>
+  <xacro:property name="hand_y" value="0.07"/>
+  <xacro:property name="hand_z" value="0.10"/>
+  <xacro:property name="hand_mass" value="0.4"/>
+  <xacro:property name="shoulder_y" value="0.245"/>
+
+  <!-- ===================== Materials ===================== -->
+  <material name="body_white">
+    <color rgba="0.93 0.94 0.95 1.0"/>
+  </material>
+  <material name="shell_dark">
+    <color rgba="0.08 0.09 0.10 1.0"/>
+  </material>
+  <material name="accent_cyan">
+    <color rgba="0.15 0.85 0.95 1.0"/>
+  </material>
+  <material name="wheel_black">
+    <color rgba="0.05 0.05 0.05 1.0"/>
+  </material>
+
+  <xacro:include filename="$(find robot_description)/urdf/base.xacro"/>
+  <xacro:include filename="$(find robot_description)/urdf/body.xacro"/>
+  <xacro:include filename="$(find robot_description)/urdf/sensors.xacro"/>
+  <xacro:include filename="$(find robot_description)/urdf/gazebo.xacro"/>
+
+</robot>

@@ -1,0 +1,232 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ============== lower body / skirt ============== -->
+  <link name="skirt_link">
+    <visual>
+      <origin xyz="0 0 0.09" rpy="0 0 0"/>
+      <geometry><cylinder radius="${skirt_r_bottom}" length="0.18"/></geometry>
+      <material name="body_white"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0.25" rpy="0 0 0"/>
+      <geometry><cylinder radius="${skirt_r_mid}" length="0.14"/></geometry>
+      <material name="body_white"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0.38" rpy="0 0 0"/>
+      <geometry><cylinder radius="${skirt_r_top}" length="0.12"/></geometry>
+      <material name="body_white"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.22" rpy="0 0 0"/>
+      <geometry><cylinder radius="${skirt_r_bottom}" length="${skirt_height}"/></geometry>
+    </collision>
+    <xacro:inertial_cylinder mass="${skirt_mass}" radius="${skirt_r_bottom}" length="${skirt_height}">
+      <origin xyz="0 0 0.22" rpy="0 0 0"/>
+    </xacro:inertial_cylinder>
+  </link>
+
+  <joint name="skirt_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="skirt_link"/>
+    <origin xyz="0 0 0.165" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ============== torso ============== -->
+  <link name="torso_link">
+    <visual>
+      <origin xyz="0 0 ${torso_z / 2}" rpy="0 0 0"/>
+      <geometry><box size="${torso_x} ${torso_y} ${torso_z}"/></geometry>
+      <material name="body_white"/>
+    </visual>
+    <visual>
+      <origin xyz="0 ${torso_y / 2} 0.25" rpy="0 0 0"/>
+      <geometry><sphere radius="${shoulder_radius}"/></geometry>
+      <material name="body_white"/>
+    </visual>
+    <visual>
+      <origin xyz="0 ${-torso_y / 2} 0.25" rpy="0 0 0"/>
+      <geometry><sphere radius="${shoulder_radius}"/></geometry>
+      <material name="body_white"/>
+    </visual>
+    <!-- chest display -->
+    <visual>
+      <origin xyz="${torso_x / 2 + 0.01} 0 0.15" rpy="0 0 0"/>
+      <geometry><box size="0.02 0.24 0.15"/></geometry>
+      <material name="shell_dark"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${torso_z / 2}" rpy="0 0 0"/>
+      <geometry><box size="${torso_x} ${torso_y} ${torso_z}"/></geometry>
+    </collision>
+    <xacro:inertial_box mass="${torso_mass}" x="${torso_x}" y="${torso_y}" z="${torso_z}">
+      <origin xyz="0 0 ${torso_z / 2}" rpy="0 0 0"/>
+    </xacro:inertial_box>
+  </link>
+
+  <joint name="torso_joint" type="fixed">
+    <parent link="skirt_link"/>
+    <child link="torso_link"/>
+    <origin xyz="0 0 ${skirt_height}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ============== neck ============== -->
+  <link name="neck_link">
+    <visual>
+      <origin xyz="0 0 ${neck_height / 2}" rpy="0 0 0"/>
+      <geometry><cylinder radius="${neck_radius}" length="${neck_height}"/></geometry>
+      <material name="shell_dark"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${neck_height / 2}" rpy="0 0 0"/>
+      <geometry><cylinder radius="${neck_radius}" length="${neck_height}"/></geometry>
+    </collision>
+    <xacro:inertial_cylinder mass="${neck_mass}" radius="${neck_radius}" length="${neck_height}">
+      <origin xyz="0 0 ${neck_height / 2}" rpy="0 0 0"/>
+    </xacro:inertial_cylinder>
+  </link>
+
+  <joint name="neck_joint" type="fixed">
+    <parent link="torso_link"/>
+    <child link="neck_link"/>
+    <origin xyz="0 0 ${torso_z}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ============== head ============== -->
+  <link name="head_link">
+    <visual>
+      <origin xyz="0 0 ${head_z / 2}" rpy="0 0 0"/>
+      <geometry><box size="${head_x} ${head_y} ${head_z}"/></geometry>
+      <material name="body_white"/>
+    </visual>
+    <!-- ears -->
+    <visual>
+      <origin xyz="0 ${head_y / 2} 0.135" rpy="${pi/2} 0 0"/>
+      <geometry><cylinder radius="0.05" length="0.04"/></geometry>
+      <material name="accent_cyan"/>
+    </visual>
+    <visual>
+      <origin xyz="0 ${-head_y / 2} 0.135" rpy="${pi/2} 0 0"/>
+      <geometry><cylinder radius="0.05" length="0.04"/></geometry>
+      <material name="accent_cyan"/>
+    </visual>
+    <!-- face screen panel -->
+    <visual>
+      <origin xyz="${head_x / 2 + 0.01} 0 0.14" rpy="0 0 0"/>
+      <geometry><box size="0.02 0.30 0.22"/></geometry>
+      <material name="shell_dark"/>
+    </visual>
+    <!-- eyes -->
+    <visual>
+      <origin xyz="0.151 0.07 0.17" rpy="0 ${pi/2} 0"/>
+      <geometry><cylinder radius="0.035" length="0.01"/></geometry>
+      <material name="accent_cyan"/>
+    </visual>
+    <visual>
+      <origin xyz="0.151 -0.07 0.17" rpy="0 ${pi/2} 0"/>
+      <geometry><cylinder radius="0.035" length="0.01"/></geometry>
+      <material name="accent_cyan"/>
+    </visual>
+    <!-- mouth -->
+    <visual>
+      <origin xyz="0.151 0 0.08" rpy="0 0 0"/>
+      <geometry><box size="0.01 0.10 0.015"/></geometry>
+      <material name="accent_cyan"/>
+    </visual>
+    <!-- top camera lens caps (decorative; real camera sensor is a separate link) -->
+    <visual>
+      <origin xyz="0.09 0.03 ${head_z - 0.015}" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.012" length="0.01"/></geometry>
+      <material name="shell_dark"/>
+    </visual>
+    <visual>
+      <origin xyz="0.09 -0.03 ${head_z - 0.015}" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.012" length="0.01"/></geometry>
+      <material name="shell_dark"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${head_z / 2}" rpy="0 0 0"/>
+      <geometry><box size="${head_x} ${head_y} ${head_z}"/></geometry>
+    </collision>
+    <xacro:inertial_box mass="${head_mass}" x="${head_x}" y="${head_y}" z="${head_z}">
+      <origin xyz="0 0 ${head_z / 2}" rpy="0 0 0"/>
+    </xacro:inertial_box>
+  </link>
+
+  <joint name="head_joint" type="fixed">
+    <parent link="neck_link"/>
+    <child link="head_link"/>
+    <origin xyz="0 0 ${neck_height}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ============== arms ============== -->
+  <xacro:macro name="arm" params="prefix reflect">
+    <link name="${prefix}_upper_arm_link">
+      <visual>
+        <origin xyz="0 0 ${-upper_arm_length / 2}" rpy="0 0 0"/>
+        <geometry><cylinder radius="${upper_arm_radius}" length="${upper_arm_length}"/></geometry>
+        <material name="body_white"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${-upper_arm_length / 2}" rpy="0 0 0"/>
+        <geometry><cylinder radius="${upper_arm_radius}" length="${upper_arm_length}"/></geometry>
+      </collision>
+      <xacro:inertial_cylinder mass="${upper_arm_mass}" radius="${upper_arm_radius}" length="${upper_arm_length}">
+        <origin xyz="0 0 ${-upper_arm_length / 2}" rpy="0 0 0"/>
+      </xacro:inertial_cylinder>
+    </link>
+
+    <joint name="${prefix}_shoulder_joint" type="fixed">
+      <parent link="torso_link"/>
+      <child link="${prefix}_upper_arm_link"/>
+      <origin xyz="0 ${reflect * shoulder_y} 0.25" rpy="0 0 0"/>
+    </joint>
+
+    <link name="${prefix}_forearm_link">
+      <visual>
+        <origin xyz="0 0 ${-forearm_length / 2}" rpy="0 0 0"/>
+        <geometry><cylinder radius="${forearm_radius}" length="${forearm_length}"/></geometry>
+        <material name="body_white"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${-forearm_length / 2}" rpy="0 0 0"/>
+        <geometry><cylinder radius="${forearm_radius}" length="${forearm_length}"/></geometry>
+      </collision>
+      <xacro:inertial_cylinder mass="${forearm_mass}" radius="${forearm_radius}" length="${forearm_length}">
+        <origin xyz="0 0 ${-forearm_length / 2}" rpy="0 0 0"/>
+      </xacro:inertial_cylinder>
+    </link>
+
+    <joint name="${prefix}_elbow_joint" type="fixed">
+      <parent link="${prefix}_upper_arm_link"/>
+      <child link="${prefix}_forearm_link"/>
+      <origin xyz="0 0 ${-upper_arm_length}" rpy="0 0 0"/>
+    </joint>
+
+    <link name="${prefix}_hand_link">
+      <visual>
+        <origin xyz="0 0 ${-hand_z / 2}" rpy="0 0 0"/>
+        <geometry><box size="${hand_x} ${hand_y} ${hand_z}"/></geometry>
+        <material name="shell_dark"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${-hand_z / 2}" rpy="0 0 0"/>
+        <geometry><box size="${hand_x} ${hand_y} ${hand_z}"/></geometry>
+      </collision>
+      <xacro:inertial_box mass="${hand_mass}" x="${hand_x}" y="${hand_y}" z="${hand_z}">
+        <origin xyz="0 0 ${-hand_z / 2}" rpy="0 0 0"/>
+      </xacro:inertial_box>
+    </link>
+
+    <joint name="${prefix}_wrist_joint" type="fixed">
+      <parent link="${prefix}_forearm_link"/>
+      <child link="${prefix}_hand_link"/>
+      <origin xyz="0 0 ${-forearm_length}" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:arm prefix="left" reflect="1"/>
+  <xacro:arm prefix="right" reflect="-1"/>
+
+</robot>
