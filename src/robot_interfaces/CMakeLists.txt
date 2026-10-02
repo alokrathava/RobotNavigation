@@ -10,6 +10,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MapPoint.msg"
   "msg/VirtualWall.msg"
   "msg/VirtualWallArray.msg"
+  "msg/SafetyState.msg"
   "srv/CreateVirtualWall.srv"
   "srv/UpdateVirtualWall.srv"
   "srv/DeleteVirtualWall.srv"

@@ -26,7 +26,10 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(bringup_share, 'launch', 'sim.launch.py')
         ),
-        launch_arguments={'use_sim_time': use_sim_time, 'rviz': 'false'}.items(),
+        launch_arguments={
+            'use_sim_time': use_sim_time, 'rviz': 'false',
+            'headless': LaunchConfiguration('headless'),
+        }.items(),
     )
 
     # --- localization: map_server + amcl (map -> odom) ---
@@ -57,8 +60,8 @@ def generate_launch_description():
     )
 
     # --- navigation: controller/planner/behaviors/bt_navigator ---
-    # Controller and behaviors publish /cmd_vel_nav; the velocity smoother
-    # produces the final /cmd_vel consumed by the Gazebo bridge.
+    # Controller and behaviors publish /cmd_vel_nav only; the safety pipeline
+    # below produces the final /cmd_vel consumed by the Gazebo bridge.
     to_nav = [('cmd_vel', 'cmd_vel_nav')]
     controller = Node(
         package='nav2_controller', executable='controller_server',
@@ -80,11 +83,33 @@ def generate_launch_description():
         name='bt_navigator', output='screen',
         parameters=[nav2_params],
     )
+    # Pipeline: twist_mux -> velocity_smoother -> collision_monitor -> safety_supervisor -> /cmd_vel
+    twist_mux = Node(
+        package='twist_mux', executable='twist_mux',
+        name='twist_mux', output='screen',
+        parameters=[
+            os.path.join(nav_share, 'config', 'twist_mux.yaml'),
+            {'use_sim_time': use_sim_time},
+        ],
+        remappings=[('cmd_vel_out', 'cmd_vel_mux')],
+    )
     smoother = Node(
         package='nav2_velocity_smoother', executable='velocity_smoother',
         name='velocity_smoother', output='screen',
-        parameters=[nav2_params],
-        remappings=to_nav + [('cmd_vel_smoothed', 'cmd_vel')],
+        parameters=[os.path.join(nav_share, 'config', 'velocity_smoother.yaml')],
+        remappings=[('cmd_vel', 'cmd_vel_mux'), ('cmd_vel_smoothed', 'cmd_vel_smoothed')],
+    )
+    collision_monitor = Node(
+        package='nav2_collision_monitor', executable='collision_monitor',
+        name='collision_monitor', output='screen',
+        parameters=[os.path.join(nav_share, 'config', 'collision_monitor.yaml')],
+    )
+    safety_supervisor = Node(
+        package='robot_navigation', executable='safety_supervisor.py',
+        name='safety_supervisor', output='screen',
+        # Wall time on purpose: independent of /clock, and sim-time timers busy-spin in rclpy.
+        parameters=[{'use_sim_time': False}],
+        respawn=True, respawn_delay=1.0,
     )
     lifecycle_navigation = Node(
         package='nav2_lifecycle_manager',
@@ -96,7 +121,7 @@ def generate_launch_description():
             'autostart': True,
             'node_names': [
                 'controller_server', 'planner_server', 'behavior_server',
-                'velocity_smoother', 'bt_navigator',
+                'velocity_smoother', 'collision_monitor', 'bt_navigator',
             ],
         }],
     )
@@ -135,6 +160,10 @@ def generate_launch_description():
             description='Use simulation (Gazebo) clock if true',
         ),
         DeclareLaunchArgument(
+            'headless', default_value='',
+            description="Pass '-s' to run the Gazebo server without its GUI",
+        ),
+        DeclareLaunchArgument(
             'rviz', default_value='true',
             description='Launch RViz with the navigation view',
         ),
@@ -161,7 +190,10 @@ def generate_launch_description():
         planner,
         behaviors,
         bt_navigator,
+        twist_mux,
         smoother,
+        collision_monitor,
+        safety_supervisor,
         lifecycle_navigation,
         nav_monitor,
         virtual_walls,

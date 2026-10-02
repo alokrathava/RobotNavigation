@@ -19,12 +19,15 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     use_rviz = LaunchConfiguration('rviz')
+    headless = LaunchConfiguration('headless')
 
     gz_sim = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(ros_gz_sim_share, 'launch', 'gz_sim.launch.py')
         ),
-        launch_arguments={'gz_args': f'-r {world_file}'}.items(),
+        launch_arguments={
+            'gz_args': [f'-r {world_file} ', headless],
+        }.items(),
     )
 
     rsp = IncludeLaunchDescription(
@@ -71,6 +74,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'use_sim_time', default_value='true',
             description='Use simulation (Gazebo) clock if true',
+        ),
+        DeclareLaunchArgument(
+            'headless', default_value='',
+            description="Pass '-s' to run the Gazebo server without its GUI",
         ),
         DeclareLaunchArgument(
             'rviz', default_value='false',

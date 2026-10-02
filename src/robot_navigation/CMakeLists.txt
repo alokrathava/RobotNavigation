@@ -9,7 +9,7 @@ install(
 )
 
 install(
-  PROGRAMS scripts/nav_monitor.py scripts/virtual_wall_manager.py
+  PROGRAMS scripts/nav_monitor.py scripts/virtual_wall_manager.py scripts/safety_supervisor.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

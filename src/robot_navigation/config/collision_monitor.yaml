@@ -1,0 +1,60 @@
+collision_monitor:
+  ros__parameters:
+    use_sim_time: true
+    base_frame_id: "base_footprint"
+    odom_frame_id: "odom"
+    cmd_vel_in_topic: "cmd_vel_smoothed"
+    cmd_vel_out_topic: "cmd_vel_safe"
+    state_topic: "collision_monitor_state"
+    transform_tolerance: 0.3
+    source_timeout: 1.0
+    base_shift_correction: true
+    stop_pub_timeout: 0.5
+    polygons: ["PolygonStop", "PolygonSlow"]
+    # Direction-dependent stop zone: a fixed polygon would also block reversing away
+    # from the obstacle that triggered it. Body extent: +-0.27 m x, +-0.32 m y.
+    PolygonStop:
+      type: "velocity_polygon"
+      action_type: "stop"
+      holonomic: false
+      min_points: 4
+      visualize: true
+      polygon_pub_topic: "polygon_stop"
+      velocity_polygons: ["rotation", "translation_forward", "translation_backward", "stopped"]
+      rotation:
+        points: "[[0.36, 0.0], [0.26, 0.26], [0.0, 0.36], [-0.26, 0.26], [-0.36, 0.0], [-0.26, -0.26], [0.0, -0.36], [0.26, -0.26]]"
+        linear_min: -0.05
+        linear_max: 0.05
+        theta_min: -1.5
+        theta_max: 1.5
+      translation_forward:
+        points: "[[0.40, 0.36], [0.40, -0.36], [0.0, -0.36], [0.0, 0.36]]"
+        linear_min: 0.05
+        linear_max: 1.0
+        theta_min: -1.5
+        theta_max: 1.5
+      translation_backward:
+        points: "[[0.0, 0.36], [0.0, -0.36], [-0.32, -0.36], [-0.32, 0.36]]"
+        linear_min: -1.0
+        linear_max: -0.05
+        theta_min: -1.5
+        theta_max: 1.5
+      # Fallback / zero-velocity polygon; must cover every velocity.
+      stopped:
+        points: "[[0.30, 0.30], [0.30, -0.30], [-0.30, -0.30], [-0.30, 0.30]]"
+        linear_min: -1.0
+        linear_max: 1.0
+        theta_min: -1.5
+        theta_max: 1.5
+    PolygonSlow:
+      type: "polygon"
+      points: "[[0.85, 0.45], [0.85, -0.45], [-0.30, -0.45], [-0.30, 0.45]]"
+      action_type: "slowdown"
+      slowdown_ratio: 0.4
+      min_points: 4
+      visualize: true
+      polygon_pub_topic: "polygon_slowdown"
+    observation_sources: ["scan"]
+    scan:
+      type: "scan"
+      topic: "scan"

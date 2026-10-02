@@ -170,6 +170,26 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /local_costmap/published_footprint
       Value: true
+    - Class: rviz_default_plugins/Polygon
+      Enabled: true
+      Name: Collision Stop Zone
+      Color: 255; 0; 0
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /polygon_stop
+      Value: true
+    - Class: rviz_default_plugins/Polygon
+      Enabled: true
+      Name: Collision Slow Zone
+      Color: 255; 170; 0
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /polygon_slowdown
+      Value: true
     - Class: rviz_default_plugins/Map
       Enabled: true
       Name: Keepout Mask
