@@ -109,6 +109,17 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
     )
 
+    virtual_walls = Node(
+        package='robot_navigation',
+        executable='virtual_wall_manager.py',
+        name='virtual_wall_manager',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'map_yaml': map_file,
+        }],
+    )
+
     rviz = Node(
         package='rviz2',
         executable='rviz2',
@@ -153,5 +164,6 @@ def generate_launch_description():
         smoother,
         lifecycle_navigation,
         nav_monitor,
+        virtual_walls,
         rviz,
     ])

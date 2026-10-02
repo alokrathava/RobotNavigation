@@ -1,0 +1,7 @@
+MapPoint point
+---
+bool success
+string error_code
+string message
+bool restricted
+string[] wall_ids

@@ -1,0 +1,6 @@
+# map_id is the stem of <maps_dir>/<map_id>.yaml
+string map_id
+---
+bool success
+string error_code
+string message

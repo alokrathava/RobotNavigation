@@ -1,0 +1,6 @@
+---
+bool success
+string error_code
+string message
+string map_id
+VirtualWall[] walls

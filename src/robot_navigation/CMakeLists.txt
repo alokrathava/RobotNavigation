@@ -4,12 +4,12 @@ project(robot_navigation)
 find_package(ament_cmake REQUIRED)
 
 install(
-  DIRECTORY launch config rviz maps
+  DIRECTORY launch config rviz maps behavior_trees
   DESTINATION share/${PROJECT_NAME}
 )
 
 install(
-  PROGRAMS scripts/nav_monitor.py
+  PROGRAMS scripts/nav_monitor.py scripts/virtual_wall_manager.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

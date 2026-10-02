@@ -170,6 +170,28 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /local_costmap/published_footprint
       Value: true
+    - Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: Keepout Mask
+      Alpha: 0.4
+      Color Scheme: costmap
+      Draw Behind: false
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Value: /robot/virtual_walls/keepout_mask
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Virtual Walls
+      Namespaces: {}
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Value: /robot/virtual_walls/markers
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48

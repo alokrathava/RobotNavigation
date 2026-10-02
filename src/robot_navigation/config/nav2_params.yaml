@@ -15,7 +15,9 @@ bt_navigator:
     navigate_through_poses:
       plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
     bt_search_directories:
+      - $(find-pkg-share robot_navigation)/behavior_trees
       - $(find-pkg-share nav2_bt_navigator)/behavior_trees
+    default_nav_to_pose_bt_xml: $(find-pkg-share robot_navigation)/behavior_trees/navigate_to_pose_keepout.xml
     error_code_name_prefixes:
       - assisted_teleop
       - backup
@@ -169,7 +171,7 @@ local_costmap:
       height: 4
       resolution: 0.05
       footprint: "[[0.27,0.11],[0.19,0.20],[0.08,0.32],[-0.08,0.32],[-0.19,0.20],[-0.27,0.11],[-0.27,-0.11],[-0.19,-0.20],[-0.08,-0.32],[0.08,-0.32],[0.19,-0.20],[0.27,-0.11]]"
-      plugins: ["obstacle_layer", "inflation_layer"]
+      plugins: ["obstacle_layer", "keepout_filter", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
@@ -188,6 +190,11 @@ local_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 4.0
         inflation_radius: 0.55
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: true
+        filter_info_topic: "/robot/virtual_walls/filter_info"
+        transform_tolerance: 0.3
       always_send_full_costmap: true
 
 global_costmap:
@@ -201,7 +208,7 @@ global_costmap:
       resolution: 0.05
       track_unknown_space: true
       footprint: "[[0.27,0.11],[0.19,0.20],[0.08,0.32],[-0.08,0.32],[-0.19,0.20],[-0.27,0.11],[-0.27,-0.11],[-0.19,-0.20],[-0.08,-0.32],[0.08,-0.32],[0.19,-0.20],[0.27,-0.11]]"
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "keepout_filter", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
@@ -223,6 +230,11 @@ global_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 4.0
         inflation_radius: 0.55
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: true
+        filter_info_topic: "/robot/virtual_walls/filter_info"
+        transform_tolerance: 0.3
       always_send_full_costmap: true
 
 planner_server:

@@ -1,0 +1,7 @@
+# Empty wall.id -> generated. wall.map_id must be empty or match the active map.
+VirtualWall wall
+---
+bool success
+string error_code
+string message
+VirtualWall wall

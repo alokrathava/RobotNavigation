@@ -1,0 +1,7 @@
+# Matched by wall.id.
+VirtualWall wall
+---
+bool success
+string error_code
+string message
+VirtualWall wall
