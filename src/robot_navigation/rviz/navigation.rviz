@@ -104,7 +104,7 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/Path
       Enabled: true
-      Name: Local Plan
+      Name: Transformed Global Plan
       Color: 0; 12; 255
       Line Style: Lines
       Pose Style: None
@@ -113,6 +113,52 @@ Visualization Manager:
         Durability Policy: Volatile
         Reliability Policy: Reliable
         Value: /transformed_global_plan
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Local Trajectory (MPPI)
+      Color: 0; 255; 0
+      Line Style: Lines
+      Pose Style: None
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /controller_server/optimal_path
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Travelled Path
+      Color: 255; 255; 0
+      Line Style: Lines
+      Pose Style: None
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Value: /travelled_path
+      Value: true
+    - Class: rviz_default_plugins/Pose
+      Enabled: true
+      Name: Goal
+      Color: 255; 0; 255
+      Shape: Arrow
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Value: /navigation/goal
+      Value: true
+    - Class: rviz_default_plugins/PoseWithCovariance
+      Enabled: true
+      Name: AMCL Pose
+      Color: 255; 25; 0
+      Shape: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /amcl_pose
       Value: true
     - Class: rviz_default_plugins/Polygon
       Enabled: true

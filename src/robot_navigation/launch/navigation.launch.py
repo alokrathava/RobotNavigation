@@ -101,6 +101,14 @@ def generate_launch_description():
         }],
     )
 
+    nav_monitor = Node(
+        package='robot_navigation',
+        executable='nav_monitor.py',
+        name='nav_monitor',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+    )
+
     rviz = Node(
         package='rviz2',
         executable='rviz2',
@@ -144,5 +152,6 @@ def generate_launch_description():
         bt_navigator,
         smoother,
         lifecycle_navigation,
+        nav_monitor,
         rviz,
     ])

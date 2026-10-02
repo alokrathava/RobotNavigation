@@ -23,6 +23,11 @@
   <exec_depend>nav2_rviz_plugins</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>rviz2</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>tf2_ros_py</exec_depend>
   <exec_depend>teleop_twist_keyboard</exec_depend>
 
   <export>
