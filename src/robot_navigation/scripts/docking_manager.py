@@ -6,21 +6,23 @@ Topic: /robot/docking/state (robot_interfaces/DockingState, latched)
 
 Docking itself is done by nav2 opennav_docking (DockRobot / UndockRobot actions). This node runs
 the preflight checks, maps the server's feedback/result onto the robot docking states and
-confirms DOCKED only when the contacts report charging.
+confirms DOCKED only when the contacts report charging (contact is independent of any pose).
+The final approach depends on /robot/dock/detected_pose; a stale or missing detection while the
+robot is on final approach cancels the dock with FAILED_TO_DETECT_DOCK.
 """
 
 import math
 
 import rclpy
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import DockRobot, UndockRobot
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from robot_interfaces.msg import DockingState as DS
-from robot_interfaces.msg import SafetyState
+from robot_interfaces.msg import RobotTelemetry, SafetyState
 from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
@@ -52,12 +54,14 @@ class DockingManager(Node):
         self.dock_yaw = self.declare_parameter('dock_yaw', 0.0).value
         self.map_frame = self.declare_parameter('map_frame', 'map').value
         self.base_frame = self.declare_parameter('base_frame', 'base_footprint').value
-        self.docked_pos_tol = self.declare_parameter('docked_position_tolerance', 0.35).value
-        self.docked_yaw_tol = self.declare_parameter('docked_yaw_tolerance', 0.20).value
+        self.odom_frame = self.declare_parameter('odom_frame', 'odom').value
         self.align_lateral_tol = self.declare_parameter('align_lateral_tolerance', 0.03).value
         self.align_yaw_tol = self.declare_parameter('align_yaw_tolerance', 0.10).value
-        self.max_cov_xy = self.declare_parameter('max_amcl_xy_variance', 1.0).value
-        self.max_cov_yaw = self.declare_parameter('max_amcl_yaw_variance', 0.5).value
+        # Localization gate for reaching the staging area (final alignment uses the detector).
+        self.max_pos_stddev = self.declare_parameter('dock_max_position_stddev_m', 1.0).value
+        self.max_yaw_stddev = self.declare_parameter('dock_max_yaw_stddev_rad', 0.707).value
+        self.detection_timeout = self.declare_parameter('detection_timeout_s', 1.0).value
+        self.detection_max_offset = self.declare_parameter('detection_max_offset_m', 0.5).value
         self.charge_current = self.declare_parameter('charging_current_threshold', 0.2).value
         self.confirm_timeout = self.declare_parameter('charge_confirm_timeout', 4.0).value
         self.sensor_timeout = self.declare_parameter('sensor_timeout', 3.0).value
@@ -71,7 +75,8 @@ class DockingManager(Node):
         self.create_subscription(SafetyState, '/robot/safety/state', self.on_safety, latched)
         self.create_subscription(BatteryState, '/robot/battery', self.on_battery, 10)
         self.create_subscription(Bool, '/robot/dock/contact', self.on_contact, latched)
-        self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self.on_amcl, latched)
+        self.create_subscription(RobotTelemetry, '/robot/telemetry', self.on_telemetry, 10)
+        self.create_subscription(PoseStamped, '/robot/dock/detected_pose', self.on_detection, 10)
 
         self.dock_client = ActionClient(self, DockRobot, 'dock_robot')
         self.undock_client = ActionClient(self, UndockRobot, 'undock_robot')
@@ -83,7 +88,12 @@ class DockingManager(Node):
         self.battery = None
         self.battery_rx = None
         self.contact = False
-        self.amcl_cov = None
+        self.loc = None                # (position_stddev_m, yaw_stddev_rad, rx time)
+        self.detection = None          # last valid detection (PoseStamped, odom frame)
+        self.detection_rx = None
+        self.controlling = False       # server is in its final-approach controller
+        self.controlling_since = None
+        self.detect_lost = False
 
         self.state = DS.UNDOCKED
         self.initialised = False
@@ -114,9 +124,49 @@ class DockingManager(Node):
     def on_contact(self, msg):
         self.contact = msg.data
 
-    def on_amcl(self, msg):
-        c = msg.pose.covariance
-        self.amcl_cov = (c[0], c[7], c[35])
+    def on_telemetry(self, msg):
+        self.loc = (msg.localization_position_stddev_m, msg.localization_yaw_stddev_rad,
+                    self.now_s())
+
+    def on_detection(self, msg):
+        """Keep only plausible detections. Freshness is judged on receipt time (wall clock) so
+        it does not depend on the clock domain of the detector's header stamp."""
+        p = msg.pose
+        vals = (p.position.x, p.position.y, p.orientation.z, p.orientation.w)
+        if msg.header.frame_id != self.odom_frame or not all(math.isfinite(v) for v in vals):
+            return
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.odom_frame, self.map_frame, rclpy.time.Time(),
+                timeout=Duration(seconds=0.0))
+        except TransformException:
+            return
+        # Expected dock position in odom, from the map-frame dock pose.
+        t, q = tf.transform.translation, tf.transform.rotation
+        yaw = yaw_of(q)
+        ex = t.x + math.cos(yaw) * self.dock_x - math.sin(yaw) * self.dock_y
+        ey = t.y + math.sin(yaw) * self.dock_x + math.cos(yaw) * self.dock_y
+        if math.hypot(p.position.x - ex, p.position.y - ey) > self.detection_max_offset:
+            return
+        self.detection = msg
+        self.detection_rx = self.now_s()
+
+    def detection_age(self):
+        return float('nan') if self.detection_rx is None else self.now_s() - self.detection_rx
+
+    def dock_detected(self):
+        age = self.detection_age()
+        return math.isfinite(age) and age <= self.detection_timeout
+
+    def odom_pose(self):
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.odom_frame, self.base_frame, rclpy.time.Time(),
+                timeout=Duration(seconds=0.0))
+        except TransformException:
+            return None
+        t = tf.transform
+        return t.translation.x, t.translation.y, yaw_of(t.rotation)
 
     def map_pose(self):
         try:
@@ -136,18 +186,15 @@ class DockingManager(Node):
         chg = b.power_supply_status == BatteryState.POWER_SUPPLY_STATUS_CHARGING
         return self.contact and (full or (chg and b.current > self.charge_current))
 
-    def dock_frame_error(self, pose):
-        dx, dy = pose[0] - self.dock_x, pose[1] - self.dock_y
-        c, s = math.cos(self.dock_yaw), math.sin(self.dock_yaw)
-        return c * dx + s * dy, -s * dx + c * dy, wrap(pose[2] - self.dock_yaw)
+    @staticmethod
+    def dock_frame_error(pose, dock):
+        dx, dy = pose[0] - dock[0], pose[1] - dock[1]
+        c, s = math.cos(dock[2]), math.sin(dock[2])
+        return c * dx + s * dy, -s * dx + c * dy, wrap(pose[2] - dock[2])
 
     def sensed_docked(self):
-        """Contacts report charging AND the map pose is at the dock."""
-        pose = self.map_pose()
-        if pose is None or not self.charging():
-            return False
-        ex, ey, eyaw = self.dock_frame_error(pose)
-        return math.hypot(ex, ey) < self.docked_pos_tol and abs(eyaw) < self.docked_yaw_tol
+        """Contacts report charging. Deliberately independent of any pose estimate."""
+        return self.charging()
 
     # ---- preflight ----
     def preflight(self):
@@ -165,14 +212,18 @@ class DockingManager(Node):
     def localization_problem(self):
         if self.map_pose() is None:
             return 'map->base transform unavailable'
-        if self.amcl_cov is None:
+        if self.loc is None or self.now_s() - self.loc[2] > self.sensor_timeout:
+            return 'localization status unavailable'
+        pos, yaw, _ = self.loc
+        if not (math.isfinite(pos) and math.isfinite(yaw)):
             return 'localization not initialised'
-        vx, vy, vyaw = self.amcl_cov
-        if vx > self.max_cov_xy or vy > self.max_cov_xy or vyaw > self.max_cov_yaw:
+        if pos > self.max_pos_stddev or yaw > self.max_yaw_stddev:
             return 'localization uncertain'
         return None
 
     def reset_op(self):
+        self.controlling = False
+        self.detect_lost = False
         self.op = None
         self.goal_handle = None
         self.cancel_requested = False
@@ -254,6 +305,8 @@ class DockingManager(Node):
         self.err_code = 0
         self.err_msg = ''
         self.cancel_requested = False
+        self.detect_lost = False
+        self.controlling = False
         self.confirm_since = None
         self.set_state(state, detail)
 
@@ -271,6 +324,10 @@ class DockingManager(Node):
     def on_dock_feedback(self, msg):
         fb = msg.feedback
         self.retries = fb.num_retries
+        in_control = fb.state == DockRobot.Feedback.CONTROLLING
+        if in_control and not self.controlling:
+            self.controlling_since = self.now_s()
+        self.controlling = in_control
         if fb.state == DockRobot.Feedback.NAV_TO_STAGING_POSE:
             self.set_state(DS.NAVIGATING_TO_DOCK, 'navigating to staging pose')
         elif fb.state == DockRobot.Feedback.INITIAL_PERCEPTION:
@@ -283,10 +340,13 @@ class DockingManager(Node):
             self.set_state(self.state, f'retrying (attempt {fb.num_retries})')
 
     def approach_state(self):
-        pose = self.map_pose()
-        if pose is None:
+        """ALIGNING until lateral/yaw error against the *detected* dock pose is small."""
+        pose = self.odom_pose()
+        if pose is None or not self.dock_detected():
             return DS.DOCKING
-        ex, ey, eyaw = self.dock_frame_error(pose)
+        d = self.detection.pose
+        dock = (d.position.x, d.position.y, yaw_of(d.orientation))
+        ex, ey, eyaw = self.dock_frame_error(pose, dock)
         if abs(ey) > self.align_lateral_tol or abs(eyaw) > self.align_yaw_tol:
             return DS.ALIGNING
         return DS.DOCKING
@@ -294,6 +354,9 @@ class DockingManager(Node):
     def on_result(self, future):
         wrapped = future.result()
         status, result = wrapped.status, wrapped.result
+        if status == GoalStatus.STATUS_CANCELED and self.detect_lost:
+            self.finish(DS.FAILED, 904, 'dock detection lost or stale during final approach')
+            return
         if status == GoalStatus.STATUS_CANCELED:
             detail = ('cancelled by operator' if self.cancel_requested
                       else 'cancelled externally (e-stop or manual input)')
@@ -335,7 +398,22 @@ class DockingManager(Node):
         self.state = state
         self.detail = detail
 
+    def check_detection(self):
+        """Fail safely if the detector disappears or goes stale on final approach."""
+        if self.op != 'dock' or not self.controlling or self.detect_lost:
+            return
+        last = max(self.detection_rx or 0.0, self.controlling_since or 0.0)
+        if self.now_s() - last <= self.detection_timeout:
+            return
+        self.detect_lost = True
+        self.get_logger().warning('Dock detection lost or stale: cancelling dock')
+        if self.goal_handle is not None:
+            self.goal_handle.cancel_goal_async()
+        else:
+            self.cancel_requested = True
+
     def on_tick(self):
+        self.check_detection()
         # Charge confirmation after the dock controller reported success.
         if self.confirm_since is not None:
             if self.sensed_docked():
@@ -351,7 +429,7 @@ class DockingManager(Node):
         elif self.op is None:
             docked = self.sensed_docked()
             if not self.initialised:
-                if self.battery is not None and self.map_pose() is not None:
+                if self.battery is not None:
                     self.initialised = True
                     self.set_state(DS.DOCKED if docked else DS.UNDOCKED,
                                    'docked at startup' if docked else '')
@@ -382,6 +460,9 @@ class DockingManager(Node):
         msg.error_name = ERROR_NAMES.get(self.err_code, 'UNKNOWN') if self.err_code else ''
         msg.error_msg = self.err_msg
         msg.detail = self.detail
+        msg.contact = self.contact
+        msg.dock_detected = self.dock_detected()
+        msg.detection_age_s = float(self.detection_age())
         self.state_pub.publish(msg)
 
 

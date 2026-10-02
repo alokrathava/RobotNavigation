@@ -20,3 +20,6 @@ uint16 error_code            # nav2 DockRobot/UndockRobot result error code, 0 =
 string error_name            # stable id, e.g. FAILED_TO_CHARGE
 string error_msg             # server-provided text
 string detail
+bool contact                 # /robot/dock/contact, independent of pose
+bool dock_detected           # a valid, fresh /robot/dock/detected_pose is available
+float32 detection_age_s      # age of the last valid detection, NaN if none yet

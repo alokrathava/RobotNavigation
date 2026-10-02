@@ -48,11 +48,14 @@ class RobotStateManager(Node):
         self.odom_timeout = d('odom_timeout', 1.0).value
         self.replan_window = d('replanning_window', 3.0).value
         self.terminal_hold = d('terminal_state_hold', 5.0).value
-        # Localization from AMCL covariance (the only confidence signal available).
-        self.loc_ok_xy = d('localized_max_xy_variance', 0.25).value
-        self.loc_ok_yaw = d('localized_max_yaw_variance', 0.15).value
-        self.loc_lost_xy = d('lost_xy_variance', 1.0).value
-        self.loc_lost_yaw = d('lost_yaw_variance', 0.5).value
+        # Localization confidence from AMCL covariance, expressed as standard deviations:
+        #   position_stddev_m = sqrt(max(var_x, var_y)),  yaw_stddev_rad = sqrt(var_yaw)
+        # LOCALIZED at or below the localized_* limits, LOST at or above the lost_* limits,
+        # DEGRADED in between. Tunable; to be set after physical testing.
+        self.loc_ok_pos = d('localized_max_position_stddev_m', 0.5).value
+        self.loc_ok_yaw = d('localized_max_yaw_stddev_rad', 0.387).value
+        self.loc_lost_pos = d('lost_position_stddev_m', 1.0).value
+        self.loc_lost_yaw = d('lost_yaw_stddev_rad', 0.707).value
         # Self-hit rejection: scan points inside this base-frame rectangle are the robot itself.
         self.body_x = d('body_half_length', 0.27).value
         self.body_y = d('body_half_width', 0.32).value
@@ -82,7 +85,7 @@ class RobotStateManager(Node):
         self.odom = None
         self.odom_rx = None
         self.nearest = (NAN, NAN)
-        self.amcl_cov = None
+        self.amcl_stddev = None      # (position_stddev_m, yaw_stddev_rad)
         self.had_pose = False
         self.safety = None
         self.docking = None
@@ -113,7 +116,10 @@ class RobotStateManager(Node):
 
     def on_amcl(self, msg):
         c = msg.pose.covariance
-        self.amcl_cov = (c[0], c[7], c[35])
+        if min(c[0], c[7], c[35]) < 0.0:
+            self.amcl_stddev = None
+            return
+        self.amcl_stddev = (math.sqrt(max(c[0], c[7])), math.sqrt(c[35]))
 
     def on_safety(self, msg):
         self.safety = msg
@@ -220,15 +226,14 @@ class RobotStateManager(Node):
 
     # ---- localization ----
     def localization_state(self, pose_ok):
-        if self.amcl_cov is None:
+        if self.amcl_stddev is None:
             return 'UNINITIALIZED' if not self.had_pose else 'LOST'
         if not pose_ok:
             return 'LOST'
-        vx, vy, vyaw = self.amcl_cov
-        vxy = max(vx, vy)
-        if vxy > self.loc_lost_xy or vyaw > self.loc_lost_yaw:
+        pos, yaw = self.amcl_stddev
+        if pos >= self.loc_lost_pos or yaw >= self.loc_lost_yaw:
             return 'LOST'
-        if vxy > self.loc_ok_xy or vyaw > self.loc_ok_yaw:
+        if pos > self.loc_ok_pos or yaw > self.loc_ok_yaw:
             return 'DEGRADED'
         return 'LOCALIZED'
 
@@ -277,6 +282,8 @@ class RobotStateManager(Node):
 
         # LOCALIZATION
         t.localization_state = self.localization_state(pose_ok)
+        t.localization_position_stddev_m, t.localization_yaw_stddev_rad = \
+            self.amcl_stddev if self.amcl_stddev is not None else (NAN, NAN)
 
         # SAFETY
         if self.safety is not None:

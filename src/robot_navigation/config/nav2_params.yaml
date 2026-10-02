@@ -303,7 +303,7 @@ docking_server:
       staging_yaw_offset: 0.0
       dock_direction: "forward"
       rotate_to_dock: false
-      # Dock pose comes from a detector (sim: sim_power_system on /detected_dock_pose; hardware:
+      # Dock pose comes from a detector (sim: sim_dock_detector on /robot/dock/detected_pose; hardware:
       # AprilTag/vision). Detections are already the dock pose, so no frame correction.
       use_external_detection_pose: true
       external_detection_timeout: 1.0

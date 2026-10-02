@@ -23,6 +23,8 @@ string navigation_error_msg
 
 # LOCALIZATION
 string localization_state    # UNINITIALIZED LOCALIZED DEGRADED LOST
+float32 localization_position_stddev_m   # sqrt(max(var_x, var_y)) from AMCL, NaN if unknown
+float32 localization_yaw_stddev_rad      # sqrt(var_yaw) from AMCL, NaN if unknown
 
 # SAFETY
 uint8 safety_state           # robot_interfaces/SafetyState constants

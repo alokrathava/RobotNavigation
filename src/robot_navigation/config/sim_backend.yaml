@@ -1,0 +1,30 @@
+# Simulation backend parameters. Hardware drivers replace these nodes and own their own config;
+# nothing in here is robot business logic.
+# Dock pose is in the world/map frame and must match docking_server DOCK_MAIN.
+sim_dock_contact:
+  ros__parameters:
+    dock_x: 0.0
+    dock_y: 0.0
+    dock_yaw: 0.0
+    contact_tol_x: 0.08
+    contact_tol_y: 0.06
+    contact_tol_yaw: 0.20
+    contact_fault: false
+
+sim_dock_detector:
+  ros__parameters:
+    dock_x: 0.0
+    dock_y: 0.0
+    dock_yaw: 0.0
+    detector_enabled: true
+    detector_range: 3.0
+    detector_fov: 1.2
+    detector_noise_m: 0.0
+
+sim_battery:
+  ros__parameters:
+    initial_percentage: 80.0
+    capacity_ah: 20.0
+    idle_discharge_pct_per_min: 0.1
+    moving_discharge_pct_per_min: 0.6
+    charge_pct_per_min: 6.0

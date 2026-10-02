@@ -102,6 +102,7 @@ class VirtualWallManager(Node):
         self.map_yaml = None
         self.map_meta = None      # (resolution, origin_x, origin_y) from the active map yaml
         self.map_info = None      # nav_msgs/MapMetaData from the live /map
+        self.map_stamp = None     # header stamp of the live /map (sim-clock domain)
         self.walls = []
         self.status = 'NO_ACTIVE_MAP'
 
@@ -210,6 +211,7 @@ class VirtualWallManager(Node):
     def on_map(self, msg):
         with self.lock:
             self.map_info = msg.info
+            self.map_stamp = msg.header.stamp
             self.publish_mask()
 
     # ---------------------------------------------------------------- wall conversion
@@ -325,7 +327,9 @@ class VirtualWallManager(Node):
             return
         grid = OccupancyGrid()
         grid.header.frame_id = self.map_frame
-        grid.header.stamp = self.get_clock().now().to_msg()
+        # Node runs on wall time, so stamp the mask with the map's own (sim-clock) stamp.
+        if self.map_stamp is not None:
+            grid.header.stamp = self.map_stamp
         grid.info = self.map_info
         if self.map_id is None or not self.map_consistent():
             if self.map_id is not None:
@@ -503,6 +507,7 @@ class VirtualWallManager(Node):
                 resp.success, resp.error_code, resp.message = False, e.code, e.message
                 return resp
             self.map_info = holder['r'].map.info
+            self.map_stamp = holder['r'].map.header.stamp
             self.publish_all()
         resp.success, resp.error_code, resp.message = True, '', 'ok'
         return resp

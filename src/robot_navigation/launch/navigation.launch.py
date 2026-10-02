@@ -5,7 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterFile
 
@@ -16,6 +16,7 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     use_rviz = LaunchConfiguration('rviz')
+    backend = LaunchConfiguration('backend')
     map_file = LaunchConfiguration('map')
     amcl_params = LaunchConfiguration('amcl_params_file')
     nav2_params = ParameterFile(
@@ -86,7 +87,8 @@ def generate_launch_description():
     docking_server = Node(
         package='opennav_docking', executable='opennav_docking',
         name='docking_server', output='screen',
-        parameters=[nav2_params], remappings=to_nav + [('battery_state', '/robot/battery')],
+        parameters=[nav2_params], remappings=to_nav + [('battery_state', '/robot/battery'),
+                             ('detected_dock_pose', '/robot/dock/detected_pose')],
     )
     # Pipeline: twist_mux -> velocity_smoother -> collision_monitor -> safety_supervisor -> /cmd_vel
     twist_mux = Node(
@@ -131,34 +133,28 @@ def generate_launch_description():
         }],
     )
 
-    nav_monitor = Node(
-        package='robot_navigation',
-        executable='nav_monitor.py',
-        name='nav_monitor',
-        output='screen',
-        parameters=[{'use_sim_time': use_sim_time}],
-    )
-
-    virtual_walls = Node(
-        package='robot_navigation',
-        executable='virtual_wall_manager.py',
-        name='virtual_wall_manager',
-        output='screen',
-        parameters=[{
-            'use_sim_time': use_sim_time,
-            'map_yaml': map_file,
-        }],
-    )
-
-    def wall_node(script, name, extra=None):
+    def wall_node(script, name, extra=None, condition=None):
         # Wall time on purpose: sim-time timers busy-spin rclpy nodes.
         return Node(
             package='robot_navigation', executable=script, name=name, output='screen',
             parameters=[{'use_sim_time': False}] + (extra or []),
-            respawn=True, respawn_delay=1.0,
+            respawn=True, respawn_delay=1.0, condition=condition,
         )
 
-    sim_power = wall_node('sim_power_system.py', 'sim_power_system')
+    nav_monitor = wall_node('nav_monitor.py', 'nav_monitor')
+    virtual_walls = wall_node('virtual_wall_manager.py', 'virtual_wall_manager',
+                              [{'map_yaml': map_file}])
+
+    # Simulation backend for /robot/battery, /robot/dock/contact, /robot/dock/detected_pose.
+    # On hardware (backend:=hardware) the BMS / contact / dock-detector drivers publish them.
+    sim_backend_params = os.path.join(nav_share, 'config', 'sim_backend.yaml')
+    use_sim_backend = IfCondition(PythonExpression(["'", backend, "' == 'sim'"]))
+    sim_backend = []
+    for script, name in (('sim_battery.py', 'sim_battery'),
+                         ('sim_dock_contact.py', 'sim_dock_contact'),
+                         ('sim_dock_detector.py', 'sim_dock_detector')):
+        sim_backend.append(wall_node(script, name, [sim_backend_params],
+                                     condition=use_sim_backend))
     docking_manager = wall_node('docking_manager.py', 'docking_manager')
     battery_monitor = wall_node('battery_monitor.py', 'battery_monitor')
     state_manager = wall_node('robot_state_manager.py', 'robot_state_manager')
@@ -181,6 +177,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'headless', default_value='',
             description="Pass '-s' to run the Gazebo server without its GUI",
+        ),
+        DeclareLaunchArgument(
+            'backend', default_value='sim',
+            description="'sim' launches the simulated battery/dock-contact/dock-detector; "
+                        "'hardware' expects drivers to publish them",
         ),
         DeclareLaunchArgument(
             'rviz', default_value='true',
@@ -217,7 +218,7 @@ def generate_launch_description():
         nav_monitor,
         virtual_walls,
         docking_server,
-        sim_power,
+        *sim_backend,
         docking_manager,
         battery_monitor,
         state_manager,
