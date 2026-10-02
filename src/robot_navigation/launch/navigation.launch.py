@@ -83,6 +83,11 @@ def generate_launch_description():
         name='bt_navigator', output='screen',
         parameters=[nav2_params],
     )
+    docking_server = Node(
+        package='opennav_docking', executable='opennav_docking',
+        name='docking_server', output='screen',
+        parameters=[nav2_params], remappings=to_nav + [('battery_state', '/robot/battery')],
+    )
     # Pipeline: twist_mux -> velocity_smoother -> collision_monitor -> safety_supervisor -> /cmd_vel
     twist_mux = Node(
         package='twist_mux', executable='twist_mux',
@@ -121,7 +126,7 @@ def generate_launch_description():
             'autostart': True,
             'node_names': [
                 'controller_server', 'planner_server', 'behavior_server',
-                'velocity_smoother', 'collision_monitor', 'bt_navigator',
+                'velocity_smoother', 'collision_monitor', 'bt_navigator', 'docking_server',
             ],
         }],
     )
@@ -144,6 +149,20 @@ def generate_launch_description():
             'map_yaml': map_file,
         }],
     )
+
+    def wall_node(script, name, extra=None):
+        # Wall time on purpose: sim-time timers busy-spin rclpy nodes.
+        return Node(
+            package='robot_navigation', executable=script, name=name, output='screen',
+            parameters=[{'use_sim_time': False}] + (extra or []),
+            respawn=True, respawn_delay=1.0,
+        )
+
+    sim_power = wall_node('sim_power_system.py', 'sim_power_system')
+    docking_manager = wall_node('docking_manager.py', 'docking_manager')
+    battery_monitor = wall_node('battery_monitor.py', 'battery_monitor')
+    state_manager = wall_node('robot_state_manager.py', 'robot_state_manager')
+    health_monitor = wall_node('robot_health_monitor.py', 'robot_health_monitor')
 
     rviz = Node(
         package='rviz2',
@@ -197,5 +216,11 @@ def generate_launch_description():
         lifecycle_navigation,
         nav_monitor,
         virtual_walls,
+        docking_server,
+        sim_power,
+        docking_manager,
+        battery_monitor,
+        state_manager,
+        health_monitor,
         rviz,
     ])

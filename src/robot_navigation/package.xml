@@ -37,6 +37,11 @@
   <exec_depend>action_msgs</exec_depend>
   <exec_depend>tf2_ros_py</exec_depend>
   <exec_depend>teleop_twist_keyboard</exec_depend>
+  <exec_depend>opennav_docking</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

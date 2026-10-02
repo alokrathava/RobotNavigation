@@ -10,3 +10,5 @@ bool emergency_stop_active
 bool motion_inhibited    # true while E-stopped or waiting for manual input to go quiet after release
 string control_source    # "none" | "nav" | "manual"
 string detail
+uint32 dead_man_stop_count   # manual dead-man timeouts since start
+builtin_interfaces/Time last_dead_man_stop

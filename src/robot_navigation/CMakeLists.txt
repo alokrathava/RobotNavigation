@@ -10,6 +10,7 @@ install(
 
 install(
   PROGRAMS scripts/nav_monitor.py scripts/virtual_wall_manager.py scripts/safety_supervisor.py
+  scripts/sim_power_system.py scripts/docking_manager.py scripts/battery_monitor.py scripts/robot_state_manager.py scripts/robot_health_monitor.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

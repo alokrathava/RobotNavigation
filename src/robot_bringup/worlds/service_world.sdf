@@ -131,5 +131,40 @@
       </link>
     </model>
 
+    <!-- Primary charging dock DOCK_MAIN. Docked robot pose = world/map (0,0,yaw 0); the robot drives
+         forward (+x) onto the pad. All geometry is below the lidar plane (z 0.21), so it is invisible
+         to /scan, the map and the collision monitor. Terminal face at x=0.30 sits just ahead of the
+         0.27 m body front. -->
+    <model name="charging_dock_main">
+      <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
+      <link name="link">
+        <visual name="pad">
+          <pose>0.05 0 0.0015 0 0 0</pose>
+          <geometry><box><size>1.0 0.6 0.003</size></box></geometry>
+          <material><ambient>0.1 0.4 0.9 1</ambient><diffuse>0.1 0.4 0.9 1</diffuse></material>
+        </visual>
+        <visual name="arrow_shaft">
+          <pose>-0.2 0 0.004 0 0 0</pose>
+          <geometry><box><size>0.5 0.06 0.002</size></box></geometry>
+          <material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material>
+        </visual>
+        <visual name="contact_zone">
+          <pose>0 0 0.004 0 0 0</pose>
+          <geometry><box><size>0.12 0.10 0.002</size></box></geometry>
+          <material><ambient>0.1 0.9 0.2 1</ambient><diffuse>0.1 0.9 0.2 1</diffuse></material>
+        </visual>
+        <collision name="terminal">
+          <pose>0.34 0 0.06 0 0 0</pose>
+          <geometry><box><size>0.08 0.5 0.12</size></box></geometry>
+        </collision>
+        <visual name="terminal">
+          <pose>0.34 0 0.06 0 0 0</pose>
+          <geometry><box><size>0.08 0.5 0.12</size></box></geometry>
+          <material><ambient>0.9 0.7 0.1 1</ambient><diffuse>0.9 0.7 0.1 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
   </world>
 </sdf>

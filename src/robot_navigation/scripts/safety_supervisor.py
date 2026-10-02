@@ -17,7 +17,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
-NAV_ACTIONS = ('navigate_to_pose', 'navigate_through_poses')
+NAV_ACTIONS = ('navigate_to_pose', 'navigate_through_poses', 'dock_robot', 'undock_robot')
 ACTIVE = (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING, GoalStatus.STATUS_CANCELING)
 
 
@@ -46,6 +46,8 @@ class SafetySupervisor(Node):
         self.last_scan_rx = None
         self.collision_action = CollisionMonitorState.DO_NOTHING
         self.fault = False
+        self.dead_man_count = 0
+        self.last_dead_man = None
         self.active_goals = {a: False for a in NAV_ACTIONS}
         self.last_published = None
 
@@ -191,6 +193,8 @@ class SafetySupervisor(Node):
             self.last_manual_zero = True
             self.synthetic_zeros += 1
             self.manual_pub.publish(self.zero_cmd())
+            self.dead_man_count += 1
+            self.last_dead_man = self.get_clock().now().to_msg()
             self.get_logger().info('Manual dead-man timeout: zero velocity')
 
         # DiffDrive holds its last command, so zero it if the pipeline goes silent.
@@ -203,6 +207,9 @@ class SafetySupervisor(Node):
         state = SafetyState()
         state.stamp = self.get_clock().now().to_msg()
         state.emergency_stop_active = self.estop
+        state.dead_man_stop_count = self.dead_man_count
+        if self.last_dead_man is not None:
+            state.last_dead_man_stop = self.last_dead_man
         state.motion_inhibited = self.estop or self.release_hold
         if self.age(self.last_manual_rx) < self.manual_timeout:
             state.control_source = 'manual'

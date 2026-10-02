@@ -144,7 +144,7 @@ class VirtualWallManager(Node):
             except WallError as e:
                 self.get_logger().error(f'Cannot activate map {map_yaml}: {e.message}')
         else:
-            self.get_logger().warn('No map_yaml given: no active map, walls disabled')
+            self.get_logger().warning('No map_yaml given: no active map, walls disabled')
         self.publish_all()
 
     # ---------------------------------------------------------------- map / storage
@@ -305,7 +305,7 @@ class VirtualWallManager(Node):
             y0 = max(int(math.floor((min(ys) - reach - oy) / res)), 0)
             y1 = min(int(math.ceil((max(ys) + reach - oy) / res)) + 1, info.height)
             if x0 >= x1 or y0 >= y1:
-                self.get_logger().warn(f"Wall '{w['id']}' lies outside the map")
+                self.get_logger().warning(f"Wall '{w['id']}' lies outside the map")
                 continue
             px, py = self.grid_centres(info, x0, x1, y0, y1)
             hit = wall_excess(w, px, py) <= self.padding
@@ -329,7 +329,7 @@ class VirtualWallManager(Node):
         grid.info = self.map_info
         if self.map_id is None or not self.map_consistent():
             if self.map_id is not None:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"Live /map does not match active map '{self.map_id}': "
                     'publishing an empty keepout mask')
             mask = np.zeros((self.map_info.height, self.map_info.width), dtype=np.int8)
