@@ -1,4 +1,4 @@
-# map_id is the stem of <maps_dir>/<map_id>.yaml
+# Legacy compatibility endpoint. map_id is <maps_dir>/<map_id>/.
 string map_id
 ---
 bool success

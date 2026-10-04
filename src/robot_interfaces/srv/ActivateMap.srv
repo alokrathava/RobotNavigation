@@ -1,0 +1,7 @@
+string map_id
+---
+bool success
+string error_code
+string message
+robot_interfaces/MapState state
+

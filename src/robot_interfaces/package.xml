@@ -2,7 +2,7 @@
 <package format="3">
   <name>robot_interfaces</name>
   <version>0.0.0</version>
-  <description>Robot-level ROS messages and services (virtual walls).</description>
+  <description>Robot-level ROS messages and services.</description>
   <maintainer email="therevaxio@gmail.com">ghostone</maintainer>
   <license>Apache-2.0</license>
 
