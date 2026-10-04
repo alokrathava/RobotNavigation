@@ -58,7 +58,9 @@ def generate_launch_description():
         package='robot_gateway', executable='gateway_node', name='robot_gateway',
         output='screen',
         parameters=[{'maps_dir': LaunchConfiguration('maps_dir')}],
-        arguments=['--port', LaunchConfiguration('gateway_port'),
+        # The token is read from $ROBOT_GATEWAY_TOKEN when set, keeping it off the command line.
+        arguments=['--host', LaunchConfiguration('gateway_host'),
+                   '--port', LaunchConfiguration('gateway_port'),
                    '--auth-token', LaunchConfiguration('gateway_token')],
         condition=IfCondition(LaunchConfiguration('gateway')),
     )
@@ -67,6 +69,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'gateway', default_value='true', choices=['true', 'false'],
             description='Start the WebSocket gateway for external clients',
+        ),
+        DeclareLaunchArgument(
+            'gateway_host', default_value='127.0.0.1',
+            description='WebSocket gateway bind address (non-loopback requires a token)',
         ),
         DeclareLaunchArgument(
             'gateway_port', default_value='8080',
