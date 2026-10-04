@@ -15,7 +15,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from robot_interfaces.msg import SafetyState
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 
 NAV_ACTIONS = ('navigate_to_pose', 'navigate_through_poses', 'dock_robot', 'undock_robot')
 ACTIVE = (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING, GoalStatus.STATUS_CANCELING)
@@ -37,6 +37,7 @@ class SafetySupervisor(Node):
 
         self.estop = False
         self.release_hold = False       # E-stop released, waiting for manual stream to go quiet
+        self.transition_hold = False    # map lifecycle inhibits all commanded motion
         self.last_out_zero = True
         self.last_safe_rx = None
         self.last_manual_rx = None
@@ -75,6 +76,7 @@ class SafetySupervisor(Node):
         self.create_service(Trigger, '/robot/safety/emergency_stop', self.srv_estop)
         self.create_service(Trigger, '/robot/safety/release_emergency_stop', self.srv_release)
         self.create_service(Trigger, '/robot/manual/stop', self.srv_manual_stop)
+        self.create_service(SetBool, '/robot/safety/transition_hold', self.srv_transition_hold)
 
         self.create_timer(0.05, self.on_tick)
         self.create_timer(0.5, self.publish_state)
@@ -108,7 +110,7 @@ class SafetySupervisor(Node):
     def on_safe(self, msg):
         self.last_safe_rx = self.now_s()
         self.fault = False
-        if self.estop or self.release_hold:
+        if self.estop or self.release_hold or self.transition_hold:
             self.publish_cmd(self.zero_cmd())
         else:
             self.publish_cmd(msg)
@@ -171,9 +173,21 @@ class SafetySupervisor(Node):
         res.message = 'Zero manual velocity sent'
         return res
 
+    def srv_transition_hold(self, req, res):
+        self.transition_hold = bool(req.data)
+        if self.transition_hold:
+            self.publish_cmd(self.zero_cmd())
+            self.lock_pub.publish(Bool(data=True))
+            self.cancel_navigation()
+        res.success = True
+        res.message = 'map transition motion hold enabled' if self.transition_hold else \
+            'map transition motion hold released'
+        self.publish_state()
+        return res
+
     # ---- periodic ----
     def on_tick(self):
-        if self.estop:
+        if self.estop or self.transition_hold:
             self.publish_cmd(self.zero_cmd())
             self.lock_pub.publish(Bool(data=True))
             return
@@ -210,7 +224,7 @@ class SafetySupervisor(Node):
         state.dead_man_stop_count = self.dead_man_count
         if self.last_dead_man is not None:
             state.last_dead_man_stop = self.last_dead_man
-        state.motion_inhibited = self.estop or self.release_hold
+        state.motion_inhibited = self.estop or self.release_hold or self.transition_hold
         if self.age(self.last_manual_rx) < self.manual_timeout:
             state.control_source = 'manual'
         elif self.age(self.last_nav_rx) < self.nav_timeout:
@@ -221,6 +235,8 @@ class SafetySupervisor(Node):
         scan_stale = self.age(self.last_scan_rx) > self.scan_timeout
         if self.estop:
             state.state, state.detail = SafetyState.EMERGENCY_STOP, 'emergency stop engaged'
+        elif self.transition_hold:
+            state.state, state.detail = SafetyState.NORMAL, 'map transition motion hold'
         elif self.fault or scan_stale:
             state.state = SafetyState.FAULT
             state.detail = 'scan stale' if scan_stale else 'velocity pipeline silent'
@@ -239,8 +255,11 @@ def main():
     node = SafetySupervisor()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
+    except Exception:
+        if rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         rclpy.try_shutdown()

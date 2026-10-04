@@ -4,8 +4,8 @@
   built-in costmap-clear retry instead of running Spin / Wait / BackUp, which cannot
   create a route. Controller failures still trigger the normal recoveries.
 -->
-<root BTCPP_format="4" main_tree_to_execute="NavigateToPoseWReplanningAndRecovery">
-  <BehaviorTree ID="NavigateToPoseWReplanningAndRecovery">
+<root BTCPP_format="4" main_tree_to_execute="RobotNavigateToPoseKeepout">
+  <BehaviorTree ID="RobotNavigateToPoseKeepout">
     <RecoveryNode number_of_retries="6" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <ProgressCheckerSelector selected_progress_checker="{selected_progress_checker}" default_progress_checker="progress_checker" topic_name="progress_checker_selector"/>

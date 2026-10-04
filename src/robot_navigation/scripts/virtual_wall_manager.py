@@ -13,16 +13,15 @@ import yaml
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import Point
 from nav2_msgs.msg import CostmapFilterInfo
-from nav2_msgs.srv import LoadMap
 from nav_msgs.msg import OccupancyGrid
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from robot_interfaces.msg import MapPoint, VirtualWall, VirtualWallArray
+from robot_interfaces.msg import MapPoint, MapState, VirtualWall, VirtualWallArray
 from robot_interfaces.srv import (
     CheckMapPoint, ClearVirtualWalls, CreateVirtualWall, DeleteVirtualWall,
-    ListVirtualWalls, SetVirtualWallEnabled, SwitchMap, UpdateVirtualWall)
+    ListVirtualWalls, SetVirtualWallEnabled, UpdateVirtualWall)
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -91,8 +90,8 @@ def wall_excess(wall, px, py):
 class VirtualWallManager(Node):
     def __init__(self):
         super().__init__('virtual_wall_manager')
-        map_yaml = self.declare_parameter('map_yaml', '').value
-        self.walls_dir = self.declare_parameter('walls_dir', '').value
+        self.maps_dir = os.path.realpath(os.path.expanduser(
+            self.declare_parameter('maps_dir', '').value))
         self.default_thickness = self.declare_parameter('default_thickness', 0.15).value
         self.padding = self.declare_parameter('footprint_padding', 0.0).value
         self.map_frame = self.declare_parameter('map_frame', 'map').value
@@ -116,9 +115,9 @@ class VirtualWallManager(Node):
         self.marker_pub = self.create_publisher(
             MarkerArray, '/robot/virtual_walls/markers', latched)
         self.create_subscription(OccupancyGrid, '/map', self.on_map, latched)
+        self.create_subscription(MapState, '/robot/map/state', self.on_map_state, latched)
 
         cb = ReentrantCallbackGroup()
-        self.load_client = self.create_client(LoadMap, '/map_server/load_map', callback_group=cb)
         base = '/robot/virtual_walls/'
         for name, srv, handler in (
                 ('create', CreateVirtualWall, self.srv_create),
@@ -128,8 +127,7 @@ class VirtualWallManager(Node):
                 ('disable', SetVirtualWallEnabled, lambda q, r: self.srv_enable(q, r, False)),
                 ('list', ListVirtualWalls, self.srv_list),
                 ('clear', ClearVirtualWalls, self.srv_clear),
-                ('check_point', CheckMapPoint, self.srv_check_point),
-                ('switch_map', SwitchMap, self.srv_switch_map)):
+                ('check_point', CheckMapPoint, self.srv_check_point)):
             self.create_service(srv, base + name, handler, callback_group=cb)
 
         info = CostmapFilterInfo()
@@ -139,19 +137,12 @@ class VirtualWallManager(Node):
         info.multiplier = 1.0
         self.info_pub.publish(info)
 
-        if map_yaml:
-            try:
-                self.activate_map(os.path.realpath(map_yaml))
-            except WallError as e:
-                self.get_logger().error(f'Cannot activate map {map_yaml}: {e.message}')
-        else:
-            self.get_logger().warning('No map_yaml given: no active map, walls disabled')
+        self.get_logger().info('Waiting for authoritative /robot/map/state')
         self.publish_all()
 
     # ---------------------------------------------------------------- map / storage
     def walls_path(self, yaml_path, map_id):
-        directory = self.walls_dir or os.path.dirname(yaml_path)
-        return os.path.join(directory, f'{map_id}.virtual_walls.yaml')
+        return os.path.join(os.path.dirname(yaml_path), 'virtual_walls.yaml')
 
     def activate_map(self, yaml_path):
         """Make yaml_path the active map and load its walls."""
@@ -164,7 +155,7 @@ class VirtualWallManager(Node):
             raise WallError('MAP_LOAD_FAILED', f'bad map yaml {yaml_path}: {e}')
         with self.lock:
             self.map_yaml = yaml_path
-            self.map_id = os.path.splitext(os.path.basename(yaml_path))[0]
+            self.map_id = os.path.basename(os.path.dirname(yaml_path))
             self.map_meta = (resolution, origin[0], origin[1])
             self.walls = []
             self.status = 'OK'
@@ -213,6 +204,20 @@ class VirtualWallManager(Node):
             self.map_info = msg.info
             self.map_stamp = msg.header.stamp
             self.publish_mask()
+
+    def on_map_state(self, msg):
+        if not msg.active_map_id or msg.mode != MapState.MODE_LOCALIZATION:
+            return
+        with self.lock:
+            if msg.active_map_id == self.map_id:
+                return
+        yaml_path = os.path.join(self.maps_dir, msg.active_map_id, 'map.yaml')
+        try:
+            self.activate_map(os.path.realpath(yaml_path))
+            self.publish_all()
+        except WallError as exc:
+            self.get_logger().error(
+                f"Cannot load walls for map '{msg.active_map_id}': {exc.message}")
 
     # ---------------------------------------------------------------- wall conversion
     @staticmethod
@@ -481,48 +486,21 @@ class VirtualWallManager(Node):
             resp.success, resp.error_code, resp.message = True, '', 'ok'
         return resp
 
-    def srv_switch_map(self, req, resp):
-        base = self.walls_dir or (os.path.dirname(self.map_yaml) if self.map_id else '')
-        yaml_path = os.path.join(base, f'{req.map_id}.yaml')
-        if not req.map_id or not os.path.exists(yaml_path):
-            resp.success, resp.error_code = False, 'MAP_LOAD_FAILED'
-            resp.message = f'map yaml not found: {yaml_path}'
-            return resp
-        if not self.load_client.wait_for_service(timeout_sec=2.0):
-            resp.success, resp.error_code = False, 'MAP_LOAD_FAILED'
-            resp.message = '/map_server/load_map unavailable'
-            return resp
-        done = threading.Event()
-        holder = {}
-        future = self.load_client.call_async(LoadMap.Request(map_url=yaml_path))
-        future.add_done_callback(lambda f: (holder.update(r=f.result()), done.set()))
-        if not done.wait(10.0) or holder['r'].result != LoadMap.Response.RESULT_SUCCESS:
-            resp.success, resp.error_code = False, 'MAP_LOAD_FAILED'
-            resp.message = f'map_server could not load {yaml_path}'
-            return resp
-        with self.lock:
-            try:
-                self.activate_map(os.path.realpath(yaml_path))
-            except WallError as e:
-                resp.success, resp.error_code, resp.message = False, e.code, e.message
-                return resp
-            self.map_info = holder['r'].map.info
-            self.map_stamp = holder['r'].map.header.stamp
-            self.publish_all()
-        resp.success, resp.error_code, resp.message = True, '', 'ok'
-        return resp
-
-
 def main():
     rclpy.init()
     node = VirtualWallManager()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
-        executor.spin()
-    except KeyboardInterrupt:
+        while rclpy.ok():
+            executor.spin_once(timeout_sec=0.2)
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
+    except Exception:
+        if rclpy.ok():
+            raise
     finally:
+        executor.shutdown(timeout_sec=2.0)
         node.destroy_node()
         rclpy.try_shutdown()
 
