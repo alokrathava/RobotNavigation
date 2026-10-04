@@ -13,6 +13,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from tf2_ros import Buffer, TransformException, TransformListener
 
 TERMINAL = (GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_CANCELED, GoalStatus.STATUS_ABORTED)
+NAV_ACTIONS = ('navigate_to_pose', 'navigate_through_poses')
 
 
 def yaw_of(q):
@@ -37,33 +38,37 @@ class NavMonitor(Node):
         self.goal_pub = self.create_publisher(PoseStamped, 'navigation/goal', latched)
 
         self.create_subscription(Path, 'plan', self.on_plan, 10)
-        self.create_subscription(
-            GoalStatusArray, 'navigate_to_pose/_action/status', self.on_status, latched)
+        self.active_goals = {action: None for action in NAV_ACTIONS}
+        for action in NAV_ACTIONS:
+            self.create_subscription(
+                GoalStatusArray, f'{action}/_action/status',
+                lambda msg, a=action: self.on_status(a, msg), latched)
         self.create_timer(0.2, self.on_timer)
 
         self.path = Path()
         self.path.header.frame_id = self.global_frame
-        self.active_goal_id = None
-        self.goal_active = False
+
+    @property
+    def goal_active(self):
+        return any(self.active_goals.values())
 
     def on_plan(self, msg):
         if msg.poses and self.goal_active:
             self.goal_pub.publish(msg.poses[-1])
 
-    def on_status(self, msg):
+    def on_status(self, action, msg):
         executing = [s for s in msg.status_list
                      if s.status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING)]
         if executing:
             goal_id = bytes(executing[-1].goal_info.goal_id.uuid)
-            if goal_id != self.active_goal_id:
-                self.active_goal_id = goal_id
+            if goal_id != self.active_goals[action]:
+                self.active_goals[action] = goal_id
                 self.path.poses.clear()
-                self.get_logger().info('New navigation goal: travelled path reset')
-            self.goal_active = True
-        elif self.goal_active and any(s.status in TERMINAL for s in msg.status_list):
-            self.goal_active = False
-            self.active_goal_id = None
-            self.get_logger().info('Navigation goal finished')
+                self.get_logger().info(f'New {action} goal: travelled path reset')
+        elif self.active_goals[action] and any(s.status in TERMINAL for s in msg.status_list):
+            self.active_goals[action] = None
+            if not self.goal_active:
+                self.get_logger().info('Navigation goal finished')
 
     def on_timer(self):
         try:

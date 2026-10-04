@@ -70,6 +70,7 @@ MISSION_STEP_TYPES = ("NAVIGATE", "NAVIGATE_TO_LOCATION", "WAIT", "DOCK", "UNDOC
 MAX_MISSION_STEPS = 100
 MAX_WAIT_MILLIS = 3_600_000
 DOCKING_TIMEOUT_S = 300.0
+MISSION_DISCONNECT_GRACE_S = 10.0
 
 
 def ros_time_to_dict(stamp) -> Dict[str, int]:
@@ -202,6 +203,8 @@ class RobotGatewayNode(Node):
         self.active_nav_goal_handle = None
         self.mission_task: Optional[asyncio.Task] = None
         self.mission_id = ""
+        self.mission_owner = None
+        self.mission_orphan_task: Optional[asyncio.Task] = None
 
         # Subscriptions
         self.create_subscription(RobotTelemetry, "/robot/telemetry", self.on_telemetry, 10)
@@ -405,6 +408,11 @@ class RobotGatewayNode(Node):
         except Exception as exc:
             LOGGER.info("Client connection closed: %s (session: %s, reason: %s)", remote, session_id, exc)
         finally:
+            if self._mission_running() and self.mission_owner is websocket:
+                LOGGER.warning("Mission %s owner disconnected; cancelling in %.0fs unless control is retaken",
+                               self.mission_id, MISSION_DISCONNECT_GRACE_S)
+                self.mission_owner = None
+                self.mission_orphan_task = asyncio.create_task(self._cancel_orphaned_mission(self.mission_task))
             self.release_control_ownership(websocket)
             self.ws_clients.discard(websocket)
             self.authenticated_clients.discard(websocket)
@@ -1295,8 +1303,21 @@ class RobotGatewayNode(Node):
             return
 
         self.mission_id = mission.get("id") or f"mission_{uuid.uuid4().hex[:8]}"
+        self.mission_owner = ws
+        if self.mission_orphan_task is not None:
+            self.mission_orphan_task.cancel()
         self.mission_task = asyncio.create_task(self._run_mission(steps))
         await self.send_ack(ws, msg_id)
+
+    async def _cancel_orphaned_mission(self, task: asyncio.Task):
+        await asyncio.sleep(MISSION_DISCONNECT_GRACE_S)
+        if task is not self.mission_task or task.done():
+            return
+        if self.control_owner is None:
+            LOGGER.warning("Mission %s orphaned by disconnect; cancelling", self.mission_id)
+            task.cancel()
+        else:
+            self.mission_owner = self.control_owner
 
     def _cancel_mission_if_running(self):
         if self._mission_running():
