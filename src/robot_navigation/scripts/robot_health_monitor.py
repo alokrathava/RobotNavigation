@@ -18,7 +18,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from robot_interfaces.msg import DockingState as DS
 from robot_interfaces.msg import RobotBatteryState as RB
-from robot_interfaces.msg import RobotError, RobotHealth, RobotTelemetry, SafetyState
+from robot_interfaces.msg import MapState, RobotError, RobotHealth, RobotTelemetry, SafetyState
 from sensor_msgs.msg import CameraInfo, Imu, JointState, LaserScan
 from tf2_ros import Buffer, TransformException, TransformListener
 from nav_msgs.msg import Odometry
@@ -51,6 +51,10 @@ ERROR_META = {
     'LOCALIZATION_UNAVAILABLE': (RobotError.ERROR, True),
     'LOCALIZATION_LOST': (RobotError.ERROR, True),
     'MAP_UNAVAILABLE': (RobotError.ERROR, False),
+    'MAP_LOAD_FAILED': (RobotError.ERROR, True),
+    'MAP_SAVE_FAILED': (RobotError.ERROR, True),
+    'MAP_METADATA_INVALID': (RobotError.ERROR, True),
+    'MAPPING_FAILED': (RobotError.ERROR, True),
     'NAVIGATION_UNAVAILABLE': (RobotError.ERROR, False),
     'NAVIGATION_FAILED': (RobotError.WARN, True),
     'NAVIGATION_TIMEOUT': (RobotError.WARN, True),
@@ -105,6 +109,7 @@ class HealthMonitor(Node):
             'battery': d('battery_timeout', 3.0).value,
             'safety': d('safety_timeout', 2.0).value,
             'telemetry': d('telemetry_timeout', 2.0).value,
+            'map_manager': d('map_manager_timeout', 5.0).value,
         }
         self.nav_error_hold = d('navigation_error_hold', 30.0).value
         self.dead_man_hold = d('dead_man_hold', 5.0).value
@@ -132,10 +137,12 @@ class HealthMonitor(Node):
         self.safety = None
         self.docking = None
         self.battery_state = None
+        self.map_state = None
         self.create_subscription(RobotTelemetry, '/robot/telemetry', self.on_telemetry, 10)
         self.create_subscription(SafetyState, '/robot/safety/state', self.on_safety, latched)
         self.create_subscription(DS, '/robot/docking/state', self.on_docking, latched)
         self.create_subscription(RB, '/robot/battery/state', self.on_battery, latched)
+        self.create_subscription(MapState, '/robot/map/state', self.on_map_state, latched)
 
         self.life = {n: None for n in LIFECYCLE_NODES}   # name -> (state label, rx time)
         self.life_clients = {n: self.create_client(GetState, f'/{n}/get_state')
@@ -189,6 +196,10 @@ class HealthMonitor(Node):
     def on_battery(self, msg):
         self.battery_state = msg
         self.touch('battery')
+
+    def on_map_state(self, msg):
+        self.map_state = msg
+        self.touch('map_manager')
 
     def poll_lifecycle(self):
         for name, client in self.life_clients.items():
@@ -266,6 +277,25 @@ class HealthMonitor(Node):
         return Result(OK, 'TF: map->odom->base_footprint->lidar_link available')
 
     def eval_map(self):
+        age = self.age('map_manager')
+        if age is None or age > self.timeouts['map_manager']:
+            if age is None and self.starting():
+                return Result(WARN, 'map manager: starting')
+            return Result(STALE, 'map manager state stale', 'MAP_UNAVAILABLE')
+        state = self.map_state
+        if state.state == MapState.ERROR:
+            code = state.error_code if state.error_code in ERROR_META else 'MAP_LOAD_FAILED'
+            return Result(ERR, state.detail or 'map lifecycle error', code,
+                          active_map=state.active_map_id)
+        if state.error_code in ('MAP_LOAD_FAILED', 'MAP_SAVE_FAILED',
+                                'MAP_METADATA_INVALID', 'MAPPING_FAILED'):
+            return Result(WARN, state.detail, state.error_code,
+                          active_map=state.active_map_id)
+        if state.mode == MapState.MODE_MAPPING:
+            return Result(OK, 'SLAM mapping active', mode='MAPPING')
+        if state.state != MapState.ACTIVE:
+            return Result(WARN, state.detail or 'map transition active',
+                          active_map=state.active_map_id)
         active, desc = self.lifecycle('map_server')
         if self.age('map') is None:
             if self.starting():
@@ -273,10 +303,12 @@ class HealthMonitor(Node):
             return Result(ERR, 'no /map received', 'MAP_UNAVAILABLE', map_server=desc)
         if not active and not self.starting():
             return Result(WARN, f'map_server {desc}; last map retained', map_server=desc)
-        name = self.telemetry.active_map if self.telemetry else ''
+        name = state.active_map_id
         return Result(OK, f'map: {name or "loaded"}', active_map=name)
 
     def eval_localization(self):
+        if self.map_state is not None and self.map_state.mode == MapState.MODE_MAPPING:
+            return Result(OK, 'mapping mode; AMCL intentionally inactive', mode='MAPPING')
         active, desc = self.lifecycle('amcl')
         if not active:
             if self.starting():
@@ -474,8 +506,11 @@ def main():
     node = HealthMonitor()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
+    except Exception:
+        if rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         rclpy.try_shutdown()

@@ -17,6 +17,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RobotError.msg"
   "msg/RobotHealth.msg"
   "msg/RobotTelemetry.msg"
+  "msg/MapInfo.msg"
+  "msg/MapState.msg"
   "srv/CreateVirtualWall.srv"
   "srv/UpdateVirtualWall.srv"
   "srv/DeleteVirtualWall.srv"
@@ -25,6 +27,13 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ClearVirtualWalls.srv"
   "srv/SwitchMap.srv"
   "srv/CheckMapPoint.srv"
+  "srv/ListMaps.srv"
+  "srv/ActivateMap.srv"
+  "srv/StartMapping.srv"
+  "srv/StopMapping.srv"
+  "srv/SaveMap.srv"
+  "srv/RenameMap.srv"
+  "srv/DeleteMap.srv"
   DEPENDENCIES builtin_interfaces std_msgs geometry_msgs
 )
 

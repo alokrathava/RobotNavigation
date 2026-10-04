@@ -12,6 +12,8 @@ install(
   PROGRAMS scripts/nav_monitor.py scripts/virtual_wall_manager.py scripts/safety_supervisor.py
   scripts/sim_battery.py scripts/sim_dock_contact.py scripts/sim_dock_detector.py
   scripts/docking_manager.py scripts/battery_monitor.py scripts/robot_state_manager.py scripts/robot_health_monitor.py
+  scripts/navigation_runtime_coordinator.py
+  scripts/map_manager.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

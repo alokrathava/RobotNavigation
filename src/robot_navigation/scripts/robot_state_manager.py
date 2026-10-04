@@ -13,14 +13,14 @@ import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
 from nav_msgs.msg import Odometry
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from robot_interfaces.msg import DockingState as DS
 from robot_interfaces.msg import RobotBatteryState as RB
-from robot_interfaces.msg import RobotTelemetry, SafetyState, VirtualWallArray
+from robot_interfaces.msg import MapState, RobotTelemetry, SafetyState
 from sensor_msgs.msg import LaserScan
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -70,17 +70,27 @@ class RobotStateManager(Node):
         self.create_subscription(Odometry, 'odom', self.on_odom, 10)
         self.create_subscription(LaserScan, 'scan', self.on_scan, 10)
         self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self.on_amcl, latched)
-        self.create_subscription(GoalStatusArray, 'navigate_to_pose/_action/status',
-                                 self.on_nav_status, latched)
-        self.create_subscription(NavigateToPose.Impl.FeedbackMessage,
-                                 'navigate_to_pose/_action/feedback', self.on_nav_feedback, 10)
+        # Both navigation actions drive the same state machine; the feedback fields read
+        # below (distance, recoveries, elapsed time) exist on both.
+        self.nav_actions = {
+            'navigate_to_pose': NavigateToPose,
+            'navigate_through_poses': NavigateThroughPoses,
+        }
+        for name, action in self.nav_actions.items():
+            self.create_subscription(
+                GoalStatusArray, f'{name}/_action/status',
+                lambda msg, n=name: self.on_nav_status(msg, n), latched)
+            self.create_subscription(
+                action.Impl.FeedbackMessage, f'{name}/_action/feedback',
+                self.on_nav_feedback, 10)
         self.create_subscription(PoseStamped, 'navigation/goal', self.on_goal, latched)
         self.create_subscription(SafetyState, '/robot/safety/state', self.on_safety, latched)
         self.create_subscription(DS, '/robot/docking/state', self.on_docking, latched)
         self.create_subscription(RB, '/robot/battery/state', self.on_battery, latched)
-        self.create_subscription(VirtualWallArray, '/robot/virtual_walls', self.on_walls, latched)
-        self.result_client = self.create_client(
-            NavigateToPose.Impl.GetResultService, 'navigate_to_pose/_action/get_result')
+        self.create_subscription(MapState, '/robot/map/state', self.on_map_state, latched)
+        self.result_clients = {
+            name: self.create_client(action.Impl.GetResultService, f'{name}/_action/get_result')
+            for name, action in self.nav_actions.items()}
 
         self.odom = None
         self.odom_rx = None
@@ -95,6 +105,7 @@ class RobotStateManager(Node):
 
         self.nav_state = 'IDLE'
         self.nav_goal_id = None
+        self.nav_goal_action = None
         self.nav_error = (0, '')
         self.nav_terminal_at = None
         self.nav_feedback = None
@@ -130,8 +141,8 @@ class RobotStateManager(Node):
     def on_battery(self, msg):
         self.battery = msg
 
-    def on_walls(self, msg):
-        self.map_id = msg.map_id
+    def on_map_state(self, msg):
+        self.map_id = msg.active_map_id
 
     def on_goal(self, msg):
         self.goal_pose = msg
@@ -166,12 +177,13 @@ class RobotStateManager(Node):
         self.nearest = (float(dist[i]), float(math.atan2(y[i], x[i])))
 
     # ---- navigation state ----
-    def on_nav_status(self, msg):
+    def on_nav_status(self, msg, action_name):
         active = [s for s in msg.status_list if s.status in ACTIVE]
         if active:
             gid = bytes(active[-1].goal_info.goal_id.uuid)
             if gid != self.nav_goal_id:
                 self.nav_goal_id = gid
+                self.nav_goal_action = action_name
                 self.nav_feedback = None
                 self.nav_got_feedback = False
                 self.nav_recoveries = 0
@@ -190,10 +202,11 @@ class RobotStateManager(Node):
             self.nav_state = {GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
                               GoalStatus.STATUS_CANCELED: 'CANCELLED'}.get(status, 'FAILED')
             self.nav_terminal_at = self.now_s()
-            if self.nav_state == 'FAILED' and self.result_client.service_is_ready():
-                req = NavigateToPose.Impl.GetResultService.Request()
+            result_client = self.result_clients.get(self.nav_goal_action)
+            if self.nav_state == 'FAILED' and result_client and result_client.service_is_ready():
+                req = self.nav_actions[self.nav_goal_action].Impl.GetResultService.Request()
                 req.goal_id.uuid = list(self.nav_goal_id)
-                self.result_client.call_async(req).add_done_callback(self.on_nav_result)
+                result_client.call_async(req).add_done_callback(self.on_nav_result)
             self.nav_goal_id = None
 
     def on_nav_result(self, future):
@@ -324,8 +337,11 @@ def main():
     node = RobotStateManager()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
+    except Exception:
+        if rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         rclpy.try_shutdown()

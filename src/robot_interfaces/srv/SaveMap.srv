@@ -1,0 +1,9 @@
+string map_id
+string display_name
+bool overwrite
+---
+bool success
+string error_code
+string message
+robot_interfaces/MapInfo map
+
