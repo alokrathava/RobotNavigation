@@ -14,6 +14,8 @@ from tf2_ros import Buffer, TransformException, TransformListener
 
 TERMINAL = (GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_CANCELED, GoalStatus.STATUS_ABORTED)
 NAV_ACTIONS = ('navigate_to_pose', 'navigate_through_poses')
+STATUS_NAMES = {GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED', GoalStatus.STATUS_CANCELED: 'CANCELED',
+                GoalStatus.STATUS_ABORTED: 'ABORTED'}
 
 
 def yaw_of(q):
@@ -38,45 +40,74 @@ class NavMonitor(Node):
         self.goal_pub = self.create_publisher(PoseStamped, 'navigation/goal', latched)
 
         self.create_subscription(Path, 'plan', self.on_plan, 10)
-        self.active_goals = {action: None for action in NAV_ACTIONS}
+        # Navigation identity is (action_type, goal_uuid); one shared boolean cannot tell
+        # the two action status topics apart.
+        self.active = None
+        self.seen_status = set()
+        self.tf_ready = False
+        self.timer_ticked = False
+        self.tf_wait_logged = 0.0
         for action in NAV_ACTIONS:
             self.create_subscription(
                 GoalStatusArray, f'{action}/_action/status',
                 lambda msg, a=action: self.on_status(a, msg), latched)
+            self.get_logger().info(f'Subscribed to {action}/_action/status')
         self.create_timer(0.2, self.on_timer)
+        self.get_logger().info('Timer created (0.2 s)')
 
         self.path = Path()
         self.path.header.frame_id = self.global_frame
-
-    @property
-    def goal_active(self):
-        return any(self.active_goals.values())
+        self.get_logger().info('nav_monitor ready')
 
     def on_plan(self, msg):
-        if msg.poses and self.goal_active:
+        if msg.poses and self.active is not None:
             self.goal_pub.publish(msg.poses[-1])
 
     def on_status(self, action, msg):
-        executing = [s for s in msg.status_list
-                     if s.status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING)]
-        if executing:
-            goal_id = bytes(executing[-1].goal_info.goal_id.uuid)
-            if goal_id != self.active_goals[action]:
-                self.active_goals[action] = goal_id
+        if action not in self.seen_status:
+            self.seen_status.add(action)
+            self.get_logger().info(
+                f'First {action} status message received ({len(msg.status_list)} entries)')
+
+        by_uuid = {bytes(s.goal_info.goal_id.uuid): s.status for s in msg.status_list}
+
+        if self.active is not None:
+            active_action, active_uuid = self.active
+            status = by_uuid.get(active_uuid) if active_action == action else None
+            if status in TERMINAL:
+                self.get_logger().info(
+                    f'Navigation finished: type={active_action} goal_uuid={active_uuid.hex()} '
+                    f'status={STATUS_NAMES[status]}')
+                self.active = None
+
+        running = [s for s in msg.status_list
+                   if s.status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING)]
+        if running:
+            goal_id = bytes(running[-1].goal_info.goal_id.uuid)
+            if self.active != (action, goal_id):
+                self.active = (action, goal_id)
                 self.path.poses.clear()
-                self.get_logger().info(f'New {action} goal: travelled path reset')
-        elif self.active_goals[action] and any(s.status in TERMINAL for s in msg.status_list):
-            self.active_goals[action] = None
-            if not self.goal_active:
-                self.get_logger().info('Navigation goal finished')
+                self.get_logger().info(
+                    f'Navigation started: type={action} goal_uuid={goal_id.hex()}')
 
     def on_timer(self):
+        if not self.timer_ticked:
+            self.timer_ticked = True
+            self.get_logger().info('Timer running (first tick)')
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.global_frame, self.robot_frame, rclpy.time.Time(),
                 timeout=Duration(seconds=0.0))
-        except TransformException:
+        except TransformException as exc:
+            now = self.get_clock().now().nanoseconds * 1e-9
+            if not self.tf_ready and now - self.tf_wait_logged >= 10.0:
+                self.tf_wait_logged = now
+                self.get_logger().warning(
+                    f'TF {self.global_frame}->{self.robot_frame} not available yet: {exc}')
             return
+        if not self.tf_ready:
+            self.tf_ready = True
+            self.get_logger().info(f'TF {self.global_frame}->{self.robot_frame} available')
 
         pose = PoseStamped()
         pose.header.frame_id = self.global_frame

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import logging
 import math
@@ -21,20 +22,23 @@ from collections import deque
 from typing import Any, Dict, List, Optional, Set
 
 import rclpy
-from action_msgs.msg import GoalStatus
+from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import PoseStamped, TwistStamped
+from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
 from rcl_interfaces.msg import Log, Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.time import Time
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_action_status_default
 from rclpy.utilities import remove_ros_args
 from robot_interfaces.msg import DockingState, MapPoint as RosMapPoint, MapState, RobotBatteryState, RobotHealth, RobotTelemetry, SafetyState, VirtualWall as RosVirtualWall
 from robot_interfaces.srv import ActivateMap, CheckMapPoint, ClearVirtualWalls, CreateVirtualWall, DeleteMap, DeleteVirtualWall, ListMaps, ListVirtualWalls, RenameMap, SaveMap, SetVirtualWallEnabled, StartMapping, StopMapping, UpdateVirtualWall
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
+from unique_identifier_msgs.msg import UUID as UuidMsg
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
@@ -45,6 +49,22 @@ SPIN_BATCH = 25
 LOG_LEVEL_NAMES = {10: "DEBUG", 20: "INFO", 30: "WARN", 40: "ERROR", 50: "ERROR"}  # FATAL -> ERROR (SDK has no FATAL)
 MAP_TRANSITION_TIMEOUT = 120.0  # lifecycle cycles (RESET/STARTUP, SLAM save) can take tens of seconds
 MAX_MESSAGE_SIZE_BYTES = 5_000_000  # 5 MB payload limit
+NAV_GOAL_RESPONSE_TIMEOUT_S = 10.0
+NAV_CANCEL_WAIT_S = 5.0  # bounded wait for a cancelled navigator to reach a terminal state
+LOOP_LAG_PERIOD_S = 0.1
+SLOW_RESPONSE_WARN_S = 1.0  # pending goal response age that triggers a diagnostic warning
+METRIC_WINDOW_S = 1.0
+METRIC_WINDOWS_KEPT = 120
+ACTIVE_GOAL_STATUSES = (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING, GoalStatus.STATUS_CANCELING)
+NAV_NONE, NAV_TO, NAV_THROUGH, NAV_MISSION = "NONE", "NAVIGATE_TO", "NAVIGATE_THROUGH", "MISSION_NAVIGATE"
+NAV_ACTION_NAMES = {NAV_TO: "navigate_to_pose", NAV_THROUGH: "navigate_through_poses", NAV_MISSION: "navigate_to_pose"}
+GOAL_STATUS_NAMES = {
+    GoalStatus.STATUS_UNKNOWN: "UNKNOWN", GoalStatus.STATUS_ACCEPTED: "ACCEPTED",
+    GoalStatus.STATUS_EXECUTING: "EXECUTING", GoalStatus.STATUS_CANCELING: "CANCELING",
+    GoalStatus.STATUS_SUCCEEDED: "SUCCEEDED", GoalStatus.STATUS_CANCELED: "CANCELED",
+    GoalStatus.STATUS_ABORTED: "ABORTED",
+}
+FUTURE_OK, FUTURE_TIMEOUT, FUTURE_EXCEPTION = "OK", "TIMEOUT", "EXCEPTION"
 
 
 def _finite(value):
@@ -60,6 +80,16 @@ def _finite(value):
 def safe_dumps(obj, **kwargs) -> str:
     """json.dumps that emits null for NaN/Inf so strict JSON parsers (Kotlin) accept it."""
     return json.dumps(_finite(obj), allow_nan=False, **kwargs)
+
+
+class NavSendResult:
+    """Outcome of one navigation goal send; `code` is None when Nav2 accepted the goal."""
+
+    def __init__(self, code=None, message="", handle=None, result_future=None):
+        self.code = code
+        self.message = message
+        self.handle = handle
+        self.result_future = result_future
 
 
 class MissionFailure(Exception):
@@ -200,7 +230,20 @@ class RobotGatewayNode(Node):
             self.create_client(CancelGoal, "navigate_to_pose/_action/cancel_goal"),
             self.create_client(CancelGoal, "navigate_through_poses/_action/cancel_goal"),
         ]
-        self.active_nav_goal_handle = None
+        self.srv_bt_state = self.create_client(GetState, "/bt_navigator/get_state")
+        self.active_navigation_type = NAV_NONE
+        self.active_goal_handle = None
+        self.active_goal_uuid = b""
+        # Goals reported ACCEPTED/EXECUTING/CANCELING on each action's status topic, by uuid.
+        # Includes goals sent from RViz or the CLI, not just through this gateway.
+        self.status_active: Dict[str, Dict[bytes, int]] = {a: {} for a in set(NAV_ACTION_NAMES.values())}
+        self.pending_nav: Dict[str, Dict[str, Any]] = {}  # request id -> in-flight goal send
+        self.timed_out_goals: Dict[bytes, str] = {}  # uuid -> request id, for late-accept evidence
+        self.goal_status_seen: Dict[bytes, float] = {}  # uuid -> monotonic first seen on a status topic
+        self.runtime_ready: Optional[bool] = None
+        self.runtime_ready_at = 0.0
+        self.metric_window: Dict[str, float] = self._new_metric_window()
+        self.metric_windows: deque = deque(maxlen=METRIC_WINDOWS_KEPT)
         self.mission_task: Optional[asyncio.Task] = None
         self.mission_id = ""
         self.mission_owner = None
@@ -214,6 +257,11 @@ class RobotGatewayNode(Node):
         self.create_subscription(RobotHealth, "/robot/health", self.on_health, latched_qos)
         self.create_subscription(MapState, "/robot/map/state", self.on_map_state, latched_qos)
         self.create_subscription(Log, "/rosout", self.on_rosout, 100)
+        self.create_subscription(Bool, "/robot/navigation/runtime_ready", self.on_runtime_ready, latched_qos)
+        for action in self.status_active:
+            self.create_subscription(
+                GoalStatusArray, f"{action}/_action/status",
+                lambda msg, a=action: self.on_nav_status(a, msg), qos_profile_action_status_default)
 
         self.last_telemetry = None
         self.last_battery = None
@@ -355,6 +403,54 @@ class RobotGatewayNode(Node):
         self.last_map_state = payload
         self.broadcast_event("map_state", payload)
 
+    def on_runtime_ready(self, msg: Bool):
+        self.runtime_ready = bool(msg.data)
+        self.runtime_ready_at = time.monotonic()
+
+    def on_nav_status(self, action: str, msg: GoalStatusArray):
+        now = time.monotonic()
+        active: Dict[bytes, int] = {}
+        for entry in msg.status_list:
+            uuid_bytes = bytes(entry.goal_info.goal_id.uuid)
+            if entry.status in ACTIVE_GOAL_STATUSES:
+                active[uuid_bytes] = entry.status
+            if uuid_bytes in self.timed_out_goals and entry.status in ACTIVE_GOAL_STATUSES:
+                LOGGER.warning(
+                    "LATE_ACCEPT request=%s goal_uuid=%s action=%s status=%s: Nav2 accepted a goal whose "
+                    "response the gateway had already given up on",
+                    self.timed_out_goals[uuid_bytes], uuid_bytes.hex(), action, GOAL_STATUS_NAMES.get(entry.status))
+            if uuid_bytes not in self.goal_status_seen and any(
+                    p["uuid"] == uuid_bytes for p in self.pending_nav.values()):
+                self.goal_status_seen[uuid_bytes] = now
+        self.status_active[action] = active
+
+    # ---- ROS loop instrumentation (measure only) ----
+    @staticmethod
+    def _new_metric_window() -> Dict[str, float]:
+        return {"start": time.monotonic(), "max_spin_gap": 0.0, "max_spin_batch": 0.0,
+                "max_spin_once": 0.0, "max_loop_lag": 0.0}
+
+    def record_metric(self, name: str, value: float):
+        if value > self.metric_window[name]:
+            self.metric_window[name] = value
+
+    def roll_metric_window(self) -> Optional[Dict[str, float]]:
+        """Close the current window once it is old enough; returns it when closed."""
+        now = time.monotonic()
+        if now - self.metric_window["start"] < METRIC_WINDOW_S:
+            return None
+        closed = dict(self.metric_window, end=now)
+        self.metric_windows.append(closed)
+        self.metric_window = self._new_metric_window()
+        return closed
+
+    def metrics_between(self, t0: float, t1: float) -> Dict[str, float]:
+        """Worst loop figures in 1 s windows overlapping [t0, t1] (including the open window)."""
+        windows = [w for w in self.metric_windows if w["end"] >= t0 and w["start"] <= t1]
+        windows.append(dict(self.metric_window))
+        return {k: round(max(w[k] for w in windows), 4)
+                for k in ("max_spin_gap", "max_spin_batch", "max_spin_once", "max_loop_lag")}
+
     def broadcast_event(self, event_type: str, payload: Any):
         if not self.authenticated_clients:
             return
@@ -377,6 +473,14 @@ class RobotGatewayNode(Node):
         if self.control_owner is None:
             self.control_owner = ws
             LOGGER.info("Control session acquired by session %s", self.session_ids.get(ws))
+            if self._mission_running() and self.mission_owner is None:
+                # An orphaned mission is adopted by the new controller; its own disconnect
+                # then starts a fresh grace period.
+                self.mission_owner = ws
+                if self.mission_orphan_task is not None:
+                    self.mission_orphan_task.cancel()
+                    self.mission_orphan_task = None
+                LOGGER.info("Mission %s adopted by session %s", self.mission_id, self.session_ids.get(ws))
             return True
         return self.control_owner == ws
 
@@ -647,6 +751,22 @@ class RobotGatewayNode(Node):
         except Exception:
             return None
 
+    async def _await_future_outcome(self, future, timeout: float):
+        """Like _await_future, but keeps timeout, exception and result distinct.
+
+        Returns (FUTURE_OK, result, None), (FUTURE_TIMEOUT, None, None) or (FUTURE_EXCEPTION, None, exc).
+        """
+        deadline = time.monotonic() + timeout
+        while not future.done():
+            if time.monotonic() > deadline:
+                future.cancel()
+                return FUTURE_TIMEOUT, None, None
+            await asyncio.sleep(0.01)
+        try:
+            return FUTURE_OK, future.result(), None
+        except Exception as exc:
+            return FUTURE_EXCEPTION, None, exc
+
     async def handle_trigger_service(self, ws: ServerConnection, msg_id: str | None, client, name: str):
         if not client.service_is_ready():
             await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", f"{name} service is unavailable")
@@ -673,29 +793,148 @@ class RobotGatewayNode(Node):
         pose.pose.orientation.w = math.cos(yaw / 2.0)
         return pose
 
-    async def _send_nav_goal(self, ws: ServerConnection, msg_id: str | None, client, goal_msg) -> None:
-        goal_handle = await self._await_future(client.send_goal_async(goal_msg))
-        if goal_handle is None or not goal_handle.accepted:
-            await self.send_error(ws, msg_id, "GOAL_REJECTED", "Nav2 goal was rejected")
+    def _believed_active(self) -> str:
+        if self.active_navigation_type == NAV_NONE:
+            return "NONE"
+        return f"{self.active_navigation_type}:{self.active_goal_uuid.hex()}"
+
+    def _bt_state_label(self, future) -> str:
+        if future is None:
+            return "unavailable"
+        if not future.done():
+            return "pending"
+        try:
+            return future.result().current_state.label
+        except Exception as exc:
+            return f"error:{exc!r}"
+
+    async def _clear_other_navigator(self, nav_type: str) -> Optional[str]:
+        """Cancel and wait out a goal on the other navigator; None when clear, else a failure reason.
+
+        Nav2 rejects a goal for one navigator while the other is running (navigator preemption is
+        off), so a command that replaces it has to end it first.
+        """
+        mine = NAV_ACTION_NAMES[nav_type]
+        other = next(a for a in self.status_active if a != mine)
+        if not self.status_active[other]:
+            return None
+        LOGGER.info("Navigator switch %s -> %s: cancelling %d active %s goal(s): %s", other, mine,
+                    len(self.status_active[other]), other,
+                    [u.hex() for u in self.status_active[other]])
+        client = self.cancel_nav_clients[0 if other == "navigate_to_pose" else 1]
+        if client.service_is_ready():
+            await self._await_future_outcome(client.call_async(CancelGoal.Request()), NAV_CANCEL_WAIT_S)
+        deadline = time.monotonic() + NAV_CANCEL_WAIT_S
+        while self.status_active[other]:
+            if time.monotonic() > deadline:
+                return f"{other} still has active goal(s) {NAV_CANCEL_WAIT_S:.0f}s after cancel"
+            await asyncio.sleep(0.02)
+        return None
+
+    async def _send_nav_goal_core(self, nav_type: str, client, goal_msg, request_id: str,
+                                  goals: List[Dict[str, Any]], frame: str) -> NavSendResult:
+        """Send one goal, keeping every failure mode distinct, and log the whole request."""
+        action = NAV_ACTION_NAMES[nav_type]
+        info: Dict[str, Any] = {
+            "request": request_id, "action": action, "nav_type": nav_type, "frame": frame,
+            "goals": goals, "server_is_ready": client.server_is_ready(),
+            "runtime_ready": self.runtime_ready,
+            "runtime_ready_age_s": round(time.monotonic() - self.runtime_ready_at, 2) if self.runtime_ready_at else None,
+            "believed_active_before": self._believed_active(),
+            "status_active_before": {a: [u.hex() for u in d] for a, d in self.status_active.items() if d},
+        }
+
+        def finish(code, message, **extra) -> NavSendResult:
+            info.update(extra)
+            info["result"] = code or "ACCEPTED"
+            (LOGGER.info if code is None else LOGGER.warning)("nav_request %s", json.dumps(_finite(info), default=str))
+            return NavSendResult(code, message)
+
+        if not info["server_is_ready"]:
+            return finish("ACTION_SERVER_UNAVAILABLE", f"Nav2 {action} action server unavailable", accepted=False)
+
+        failure = await self._clear_other_navigator(nav_type)
+        if failure:
+            return finish("NAVIGATOR_CANCEL_TIMEOUT", failure, accepted=False)
+
+        bt_future = self.srv_bt_state.call_async(GetState.Request()) if self.srv_bt_state.service_is_ready() else None
+        goal_uuid = UuidMsg(uuid=list(uuid.uuid4().bytes))
+        uuid_bytes = bytes(goal_uuid.uuid)
+        info["goal_uuid"] = uuid_bytes.hex()
+        t_send = time.monotonic()
+        info["send_wall_time"] = time.time()
+        self.pending_nav[request_id] = {"t_send": t_send, "uuid": uuid_bytes, "warned": False}
+        try:
+            try:
+                future = client.send_goal_async(goal_msg, goal_uuid=goal_uuid)
+            except Exception as exc:
+                info["response_latency_s"] = round(time.monotonic() - t_send, 4)
+                return finish("ACTION_GOAL_SEND_EXCEPTION", f"Sending the goal raised {exc!r}",
+                              accepted=False, exception=repr(exc), bt_navigator_state=self._bt_state_label(bt_future))
+            state, handle, exc = await self._await_future_outcome(future, NAV_GOAL_RESPONSE_TIMEOUT_S)
+        finally:
+            self.pending_nav.pop(request_id, None)
+        t_resp = time.monotonic()
+        info["response_wall_time"] = time.time()
+        info["response_latency_s"] = round(t_resp - t_send, 4)
+        info["bt_navigator_state"] = self._bt_state_label(bt_future)
+        info["goal_uuid_seen_on_status_topic"] = uuid_bytes in self.goal_status_seen
+        self.goal_status_seen.pop(uuid_bytes, None)
+        info["loop_metrics"] = self.metrics_between(t_send, t_resp)
+
+        if state == FUTURE_TIMEOUT:
+            self.timed_out_goals[uuid_bytes] = request_id
+            return finish("ACTION_GOAL_RESPONSE_TIMEOUT",
+                          f"No goal response from {action} within {NAV_GOAL_RESPONSE_TIMEOUT_S:.0f}s", accepted=None)
+        if state == FUTURE_EXCEPTION:
+            return finish("ACTION_GOAL_SEND_EXCEPTION", f"Goal send failed: {exc!r}", accepted=None, exception=repr(exc))
+        if not handle.accepted:
+            return finish("NAV2_GOAL_REJECTED", f"Nav2 {action} returned accepted=false", accepted=False)
+
+        result_future = handle.get_result_async()
+        self.active_navigation_type = nav_type
+        self.active_goal_handle = handle
+        self.active_goal_uuid = uuid_bytes
+
+        def on_done(done_future, handle=handle, request=request_id, started=t_send):
+            try:
+                result = done_future.result()
+                code = getattr(result.result, "error_code", None)
+                msg = getattr(result.result, "error_msg", "")
+                LOGGER.info("nav_result request=%s goal_uuid=%s status=%s error_code=%s error_msg=%r duration_s=%.2f",
+                            request, uuid_bytes.hex(), GOAL_STATUS_NAMES.get(result.status, result.status),
+                            code, msg, time.monotonic() - started)
+            except Exception as exc:
+                LOGGER.warning("nav_result request=%s goal_uuid=%s result future failed: %r", request, uuid_bytes.hex(), exc)
+            if self.active_goal_handle is handle:
+                self.active_navigation_type = NAV_NONE
+                self.active_goal_handle = None
+                self.active_goal_uuid = b""
+
+        result_future.add_done_callback(on_done)
+        info["accepted"] = True
+        finish(None, "")
+        return NavSendResult(None, "", handle, result_future)
+
+    async def _send_nav_goal(self, ws: ServerConnection, msg_id: str | None, nav_type: str, client,
+                             goal_msg, goals: List[Dict[str, Any]], frame: str) -> None:
+        # A manual command replaces a running mission: end it, and its Nav2 goal, first.
+        await self._cancel_mission_and_wait()
+        request_id = msg_id or f"gw_{uuid.uuid4().hex[:8]}"
+        outcome = await self._send_nav_goal_core(nav_type, client, goal_msg, request_id, goals, frame)
+        if outcome.code:
+            await self.send_error(ws, msg_id, outcome.code, outcome.message)
             return
-
-        self.active_nav_goal_handle = goal_handle
-
-        def on_done(_future, handle=goal_handle):
-            if self.active_nav_goal_handle is handle:
-                self.active_nav_goal_handle = None
-
-        goal_handle.get_result_async().add_done_callback(on_done)
         await self.send_ack(ws, msg_id)
 
-    async def handle_navigate_to(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
-        if not self.nav_client.server_is_ready():
-            await self.send_error(ws, msg_id, "ACTION_SERVER_UNAVAILABLE", "Nav2 navigate_to_pose action server unavailable")
-            return
+    def _goal_summary(self, point: Dict[str, Any]) -> Dict[str, Any]:
+        return {"x": point.get("xMeters"), "y": point.get("yMeters"), "yaw": point.get("yawRadians")}
 
+    async def handle_navigate_to(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = self._pose_stamped(payload)
-        await self._send_nav_goal(ws, msg_id, self.nav_client, goal_msg)
+        await self._send_nav_goal(ws, msg_id, NAV_TO, self.nav_client, goal_msg,
+                                  [self._goal_summary(payload)], goal_msg.pose.header.frame_id)
 
     async def handle_navigate_through(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
         waypoints_data = payload.get("waypoints", [])
@@ -703,17 +942,14 @@ class RobotGatewayNode(Node):
             await self.send_error(ws, msg_id, "INVALID_ARGUMENT", "Waypoints list cannot be empty")
             return
 
-        if not self.nav_through_client.server_is_ready():
-            await self.send_error(ws, msg_id, "ACTION_SERVER_UNAVAILABLE", "Nav2 navigate_through_poses action server unavailable")
-            return
-
         goal_msg = NavigateThroughPoses.Goal()
         goal_msg.poses.header.frame_id = "map"
         goal_msg.poses.goals = [self._pose_stamped(wp) for wp in waypoints_data]
-        await self._send_nav_goal(ws, msg_id, self.nav_through_client, goal_msg)
+        await self._send_nav_goal(ws, msg_id, NAV_THROUGH, self.nav_through_client, goal_msg,
+                                  [self._goal_summary(wp) for wp in waypoints_data], "map")
 
     async def handle_cancel_navigation(self, ws: ServerConnection, msg_id: str | None):
-        self._cancel_mission_if_running()
+        await self._cancel_mission_and_wait()
         # Zero goal id + zero stamp cancels every goal on the action, including ones
         # that were not sent through this gateway (RViz, other clients).
         ready = [c for c in self.cancel_nav_clients if c.service_is_ready()]
@@ -721,7 +957,6 @@ class RobotGatewayNode(Node):
             await self.send_error(ws, msg_id, "ACTION_SERVER_UNAVAILABLE", "Nav2 navigation action servers unavailable")
             return
 
-        self.active_nav_goal_handle = None
         for client in ready:
             await self._await_future(client.call_async(CancelGoal.Request()), timeout=5.0)
         await self.send_ack(ws, msg_id)
@@ -1323,8 +1558,18 @@ class RobotGatewayNode(Node):
         if self._mission_running():
             self.mission_task.cancel()
 
+    async def _cancel_mission_and_wait(self):
+        """Cancel the mission and wait until it has ended, which includes its Nav2 goal."""
+        task = self.mission_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=NAV_CANCEL_WAIT_S + 2.0)
+        if not done:
+            LOGGER.warning("Mission %s did not finish cancelling within %.0fs", self.mission_id, NAV_CANCEL_WAIT_S + 2.0)
+
     async def handle_cancel_mission(self, ws: ServerConnection, msg_id: str | None):
-        self._cancel_mission_if_running()
+        await self._cancel_mission_and_wait()
         await self.send_ack(ws, msg_id)
 
     async def _run_mission(self, steps: List[Dict[str, Any]]):
@@ -1366,31 +1611,37 @@ class RobotGatewayNode(Node):
             await self._mission_dock(self.srv_undock, DockingState.UNDOCKED, "Undocking")
 
     async def _mission_navigate(self, point: Dict[str, Any]):
-        if not self.nav_client.server_is_ready():
-            raise MissionFailure("Nav2 navigate_to_pose action server unavailable")
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = self._pose_stamped(point)
-        handle = await self._await_future(self.nav_client.send_goal_async(goal_msg))
-        if handle is None or not handle.accepted:
-            raise MissionFailure("Nav2 rejected the navigation goal")
+        request_id = f"{self.mission_id}_nav_{uuid.uuid4().hex[:6]}"
+        outcome = await self._send_nav_goal_core(
+            NAV_MISSION, self.nav_client, goal_msg, request_id,
+            [self._goal_summary(point)], goal_msg.pose.header.frame_id)
+        if outcome.code:
+            raise MissionFailure(f"{outcome.code}: {outcome.message}")
 
-        self.active_nav_goal_handle = handle
-        result_future = handle.get_result_async()
+        handle, result_future = outcome.handle, outcome.result_future
         try:
             while not result_future.done():
                 self._check_mission_abort()
                 await asyncio.sleep(0.1)
         except BaseException:
-            handle.cancel_goal_async()
+            await self._cancel_goal_and_wait(handle, result_future, request_id)
             raise
-        finally:
-            if self.active_nav_goal_handle is handle:
-                self.active_nav_goal_handle = None
 
         result = result_future.result()
         if result.status != GoalStatus.STATUS_SUCCEEDED:
             detail = getattr(result.result, "error_msg", "") or f"goal status {result.status}"
             raise MissionFailure(f"Navigation failed: {detail}")
+
+    async def _cancel_goal_and_wait(self, handle, result_future, request_id: str):
+        """Cancel a Nav2 goal and wait for its terminal result, logging both."""
+        outcome = await self._await_future_outcome(handle.cancel_goal_async(), NAV_CANCEL_WAIT_S)
+        state, response, exc = outcome
+        LOGGER.info("nav_cancel request=%s cancel_response=%s return_code=%s exception=%r", request_id, state,
+                    getattr(response, "return_code", None), exc)
+        state, _, exc = await self._await_future_outcome(result_future, NAV_CANCEL_WAIT_S)
+        LOGGER.info("nav_cancel request=%s terminal_result=%s exception=%r", request_id, state, exc)
 
     async def _mission_dock(self, client, target_state: int, name: str):
         if not client.service_is_ready():
@@ -1582,6 +1833,31 @@ class RobotGatewayNode(Node):
         await ws.send(safe_dumps(resp))
 
 
+async def _monitor_loop(node: RobotGatewayNode):
+    """Event-loop lag, pending goal response age and the 1 s metric windows."""
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(LOOP_LAG_PERIOD_S)
+        lag = time.monotonic() - t0 - LOOP_LAG_PERIOD_S
+        node.record_metric("max_loop_lag", lag)
+
+        for request_id, pending in node.pending_nav.items():
+            age = time.monotonic() - pending["t_send"]
+            if age > SLOW_RESPONSE_WARN_S and not pending["warned"]:
+                pending["warned"] = True
+                LOGGER.warning("nav_response_slow request=%s goal_uuid=%s pending_age_s=%.2f "
+                               "uuid_seen_on_status_topic=%s loop_metrics=%s", request_id, pending["uuid"].hex(),
+                               age, pending["uuid"] in node.goal_status_seen,
+                               node.metrics_between(pending["t_send"], time.monotonic()))
+
+        closed = node.roll_metric_window()
+        if closed and (node.pending_nav or closed["max_spin_gap"] > 0.25 or closed["max_loop_lag"] > 0.25
+                       or closed["max_spin_once"] > 0.1):
+            LOGGER.info("ros_loop_metrics pending_nav=%d max_spin_gap=%.4f max_spin_batch=%.4f "
+                        "max_spin_once=%.4f max_loop_lag=%.4f", len(node.pending_nav), closed["max_spin_gap"],
+                        closed["max_spin_batch"], closed["max_spin_once"], closed["max_loop_lag"])
+
+
 async def run_gateway(node: RobotGatewayNode):
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1592,24 +1868,49 @@ async def run_gateway(node: RobotGatewayNode):
         except NotImplementedError:
             pass
 
+    monitor = asyncio.create_task(_monitor_loop(node))
     async with serve(node.handle_client, node.host, node.port):
         LOGGER.info("Robot Gateway listening on ws://%s:%d", node.host, node.port)
+        last_batch_start = time.monotonic()
         while not stop_event.is_set():
+            batch_start = time.monotonic()
+            node.record_metric("max_spin_gap", batch_start - last_batch_start)
+            last_batch_start = batch_start
             # One spin_once handles one ready callback; drain a batch so a busy topic
             # (e.g. /rosout) cannot delay service responses.
             for _ in range(SPIN_BATCH):
+                once_start = time.monotonic()
                 rclpy.spin_once(node, timeout_sec=0)
+                node.record_metric("max_spin_once", time.monotonic() - once_start)
+            node.record_metric("max_spin_batch", time.monotonic() - batch_start)
             await asyncio.sleep(0.01)
         LOGGER.info("Robot Gateway shutting down")
+    monitor.cancel()
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run the Robot Gateway WebSocket server.")
-    parser.add_argument("--host", default="0.0.0.0", help="host/interface to bind (default: %(default)s)")
+    parser.add_argument("--host", default="127.0.0.1", help="host/interface to bind (default: %(default)s)")
     parser.add_argument("--port", type=int, default=8080, help="port to listen on (default: %(default)s)")
-    parser.add_argument("--auth-token", default="", help="required authentication token (default: none)")
+    parser.add_argument("--auth-token", default="",
+                        help="required authentication token (default: $ROBOT_GATEWAY_TOKEN, else none)")
     # ros2 launch appends --ros-args; keep them away from argparse.
-    return parser.parse_args(remove_ros_args(sys.argv)[1:])
+    args = parser.parse_args(remove_ros_args(sys.argv)[1:])
+    if not args.auth_token:
+        args.auth_token = os.environ.get("ROBOT_GATEWAY_TOKEN", "")
+    if not args.auth_token and not _is_loopback(args.host):
+        parser.error("gateway host %r is not loopback but no auth token was provided "
+                     "(--auth-token or ROBOT_GATEWAY_TOKEN)" % args.host)
+    return args
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def main():
