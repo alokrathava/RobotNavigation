@@ -186,6 +186,7 @@ class RobotGatewayNode(Node):
         self.session_ids: Dict[ServerConnection, str] = {}
         self.control_owner: Optional[ServerConnection] = None
         self.last_command_times: Dict[ServerConnection, Dict[str, float]] = {}
+        self.motion_limits_lock = asyncio.Lock()
 
         latched_qos = QoSProfile(
             depth=1,
@@ -562,6 +563,21 @@ class RobotGatewayNode(Node):
             await self.send_error(ws, msg_id, "UNAUTHENTICATED", "Handshake hello required before commands", recoverable=False)
             return
 
+        # E-stop may be engaged by any authenticated client, but releasing it requires an
+        # already-established control owner. Do not use check_control_ownership here: that
+        # helper auto-acquires an unowned session as a side effect.
+        if msg_type == "release_emergency_stop":
+            if self.control_owner is None:
+                await self.send_error(
+                    ws, msg_id, "CONTROL_SESSION_REQUIRED",
+                    "An active control owner is required to release emergency stop")
+                return
+            if self.control_owner is not ws:
+                await self.send_error(
+                    ws, msg_id, "CONTROL_SESSION_IN_USE",
+                    "Control session currently held by another client")
+                return
+
         # ---- Commands Requiring Control Ownership ----
         control_commands = {
             "manual_velocity", "navigate_to", "navigate_through", "cancel_navigation", "stop",
@@ -713,15 +729,54 @@ class RobotGatewayNode(Node):
             await ws.send(safe_dumps({"type": "map_state", "protocolVersion": PROTOCOL_VERSION, "payload": self.last_map_state}))
 
     async def handle_manual_velocity(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
-        linear = float(payload.get("linearMps", 0.0))
-        angular = float(payload.get("angularRadPerSec", 0.0))
+        if not isinstance(payload, dict):
+            await self.send_error(ws, msg_id, "INVALID_ARGUMENT", "Manual velocity payload must be an object")
+            return
 
-        twist = TwistStamped()
-        twist.header.stamp = self.get_clock().now().to_msg()
-        twist.header.frame_id = "base_footprint"
-        twist.twist.linear.x = linear
-        twist.twist.angular.z = angular
-        self.cmd_vel_pub.publish(twist)
+        linear_value = payload.get("linearMps")
+        angular_value = payload.get("angularRadPerSec")
+        values = (linear_value, angular_value)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+            await self.send_error(
+                ws, msg_id, "INVALID_ARGUMENT",
+                "linearMps and angularRadPerSec must be numbers")
+            return
+
+        linear = float(linear_value)
+        angular = float(angular_value)
+        if not (math.isfinite(linear) and math.isfinite(angular)):
+            await self.send_error(
+                ws, msg_id, "INVALID_ARGUMENT",
+                "linearMps and angularRadPerSec must be finite numbers")
+            return
+
+        error = None
+        async with self.motion_limits_lock:
+            if not await self._read_design_limits():
+                error = (
+                    "SERVICE_UNAVAILABLE",
+                    "Velocity limits are unavailable; manual motion is disabled",
+                )
+            else:
+                max_linear = self.current_limits["linear"]
+                max_angular = self.current_limits["angular"]
+                if abs(linear) > max_linear or abs(angular) > max_angular:
+                    error = (
+                        "VELOCITY_LIMIT_EXCEEDED",
+                        f"Manual velocity exceeds the active limit "
+                        f"({max_linear:.2f} m/s, {max_angular:.2f} rad/s)",
+                    )
+                else:
+                    twist = TwistStamped()
+                    twist.header.stamp = self.get_clock().now().to_msg()
+                    twist.header.frame_id = "base_footprint"
+                    twist.twist.linear.x = linear
+                    twist.twist.angular.z = angular
+                    self.cmd_vel_pub.publish(twist)
+
+        if error is not None:
+            await self.send_error(ws, msg_id, error[0], error[1])
+            return
 
         await self.send_ack(ws, msg_id)
 
@@ -1706,10 +1761,15 @@ class RobotGatewayNode(Node):
             return True
         smoother = await self._get_params(self.srv_smoother_get, ["max_velocity", "min_velocity"])
         controller = await self._get_params(self.srv_controller_get, ["FollowPath.vx_min"])
-        if smoother is None or controller is None:
+        if smoother is None or controller is None or len(controller) < 1:
             return False
         max_vel, min_vel = smoother[0].double_array_value, smoother[1].double_array_value
         if len(max_vel) < 3 or len(min_vel) < 3:
+            return False
+        configured = (max_vel[0], max_vel[2], min_vel[0], controller[0].double_value)
+        if not all(math.isfinite(value) for value in configured):
+            return False
+        if max_vel[0] <= 0.0 or max_vel[2] <= 0.0:
             return False
         self.design_limits = {
             "linear": max_vel[0],
@@ -1746,30 +1806,35 @@ class RobotGatewayNode(Node):
             await self.send_error(ws, msg_id, "INVALID_ARGUMENT", "Velocity limits must be positive numbers")
             return
 
-        if not await self._read_design_limits():
-            await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", "Navigation parameter services are unavailable")
+        error = None
+        async with self.motion_limits_lock:
+            if not await self._read_design_limits():
+                error = ("SERVICE_UNAVAILABLE", "Navigation parameter services are unavailable")
+            elif linear > self.design_limits["linear"] or angular > self.design_limits["angular"]:
+                error = (
+                    "LIMITS_EXCEEDED",
+                    f"Requested limits exceed the robot's configured maximum "
+                    f"({self.design_limits['linear']:.2f} m/s, {self.design_limits['angular']:.2f} rad/s)",
+                )
+            else:
+                smoother_params, controller_params = self._limit_params(linear, angular)
+                failure = await self._set_params(self.srv_smoother_set, smoother_params)
+                if failure is None:
+                    failure = await self._set_params(self.srv_controller_set, controller_params)
+                    if failure is not None:
+                        # Keep the two nodes consistent: put the smoother back where it was.
+                        previous, _ = self._limit_params(
+                            self.current_limits["linear"], self.current_limits["angular"])
+                        await self._set_params(self.srv_smoother_set, previous)
+                if failure is not None:
+                    error = ("LIMITS_REJECTED", f"Could not apply motion limits: {failure}")
+                else:
+                    self.current_limits = {"linear": linear, "angular": angular}
+
+        if error is not None:
+            await self.send_error(ws, msg_id, error[0], error[1])
             return
 
-        if linear > self.design_limits["linear"] or angular > self.design_limits["angular"]:
-            await self.send_error(
-                ws, msg_id, "LIMITS_EXCEEDED",
-                f"Requested limits exceed the robot's configured maximum "
-                f"({self.design_limits['linear']:.2f} m/s, {self.design_limits['angular']:.2f} rad/s)")
-            return
-
-        smoother_params, controller_params = self._limit_params(linear, angular)
-        failure = await self._set_params(self.srv_smoother_set, smoother_params)
-        if failure is None:
-            failure = await self._set_params(self.srv_controller_set, controller_params)
-            if failure is not None:
-                # Keep the two nodes consistent: put the smoother back where it was.
-                previous, _ = self._limit_params(self.current_limits["linear"], self.current_limits["angular"])
-                await self._set_params(self.srv_smoother_set, previous)
-        if failure is not None:
-            await self.send_error(ws, msg_id, "LIMITS_REJECTED", f"Could not apply motion limits: {failure}")
-            return
-
-        self.current_limits = {"linear": linear, "angular": angular}
         LOGGER.info("Updated motion limits: linear=%.2f m/s, angular=%.2f rad/s", linear, angular)
         await self.send_ack(ws, msg_id)
 
