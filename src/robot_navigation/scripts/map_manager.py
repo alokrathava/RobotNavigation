@@ -90,6 +90,8 @@ class MapManager(Node):
 
         self.lock = threading.RLock()
         self.transition_lock = threading.Lock()
+        self.transition_thread = None
+        self.shutting_down = False
         self.state = MapState.NO_MAP
         self.mode = MapState.MODE_NONE
         self.active_map_id = ''
@@ -103,6 +105,7 @@ class MapManager(Node):
         self.mapping_saved_id = ''
         self.previous_map_id = ''
         self.restore_started = False
+        self.bootstrap_pending = True
 
         cb = ReentrantCallbackGroup()
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -337,6 +340,65 @@ class MapManager(Node):
             self.detail, self.error_code = detail, error_code
             self.publish_state()
 
+    def admit_transition(self, response, prepare, state, mode, detail, operation,
+                         failure_state, accepted_message):
+        """Validate and reserve a transition, then run its slow work off the service callback."""
+        if self.shutting_down:
+            response.success, response.error_code = False, 'MAP_TRANSITION'
+            response.message = 'map manager is shutting down'
+            if hasattr(response, 'state'):
+                response.state = self.state_msg()
+            return response
+        if not self.transition_lock.acquire(blocking=False):
+            response.success, response.error_code = False, 'MAP_TRANSITION'
+            response.message = 'another map transition is active'
+            if hasattr(response, 'state'):
+                response.state = self.state_msg()
+            return response
+        try:
+            prepare()
+            self.set_state(state, mode, detail)
+            worker = threading.Thread(
+                target=self.run_transition,
+                args=(operation, failure_state),
+                name='map-transition',
+                daemon=True,
+            )
+            self.transition_thread = worker
+            worker.start()
+        except MapFailure as exc:
+            self.transition_thread = None
+            self.transition_lock.release()
+            response.success, response.error_code, response.message = False, exc.code, exc.detail
+            if hasattr(response, 'state'):
+                response.state = self.state_msg()
+            return response
+        except Exception as exc:
+            self.transition_thread = None
+            self.transition_lock.release()
+            response.success, response.error_code = False, 'MAP_TRANSITION_FAILED'
+            response.message = str(exc)
+            if hasattr(response, 'state'):
+                response.state = self.state_msg()
+            return response
+
+        response.success, response.error_code, response.message = True, '', accepted_message
+        if hasattr(response, 'state'):
+            response.state = self.state_msg()
+        return response
+
+    def run_transition(self, operation, failure_state):
+        try:
+            operation()
+        except MapFailure as exc:
+            failure_state(exc)
+        except Exception as exc:
+            self.get_logger().exception('unexpected map transition failure')
+            failure_state(MapFailure('MAP_TRANSITION_FAILED', str(exc)))
+        finally:
+            self.transition_thread = None
+            self.transition_lock.release()
+
     def call(self, client, request, unavailable, timeout=30.0):
         if not client.wait_for_service(timeout_sec=5.0):
             raise MapFailure(unavailable, f'{client.srv_name} unavailable')
@@ -433,6 +495,11 @@ class MapManager(Node):
         with self.lock:
             if self.mode != MapState.MODE_LOCALIZATION or self.state != MapState.LOADING:
                 return
+            # Only the first map from launch drives bootstrap restoration. Explicit map
+            # transitions are completed by their worker after lifecycle startup returns.
+            if not self.bootstrap_pending:
+                return
+            self.bootstrap_pending = False
             if self.active_map_id != self.default_map_id and not self.restore_started:
                 self.restore_started = True
                 restore_id = self.active_map_id
@@ -467,7 +534,7 @@ class MapManager(Node):
         self.fire_set_bool(self.nav_enable, True)
 
     # ---------- map transitions
-    def activate(self, map_id):
+    def activate(self, map_id, admitted=False):
         self.validate_id(map_id)
         info = self.validate_dir(self.map_dir(map_id), expected_id=map_id)
         if self.mode == MapState.MODE_MAPPING:
@@ -478,22 +545,25 @@ class MapManager(Node):
             self.localization_ready = False
             self.navigation_ready = False
             self.localization_generation = time.monotonic()
-        self.set_state(MapState.SWITCHING, MapState.MODE_LOCALIZATION,
-                       f"switching to map '{map_id}'")
+        if not admitted:
+            self.set_state(MapState.SWITCHING, MapState.MODE_LOCALIZATION,
+                           f"switching to map '{map_id}'")
         try:
             # Cycle map_server + amcl together through their lifecycle manager. Changing amcl
             # alone breaks its bond and the manager then takes map_server down mid-switch.
             self.manage_localization(ManageLifecycleNodes.Request.RESET)
             self.set_map_server_yaml(os.path.join(self.map_dir(map_id), 'map.yaml'))
+            self.set_state(MapState.LOADING, MapState.MODE_LOCALIZATION,
+                           f"loading map '{map_id}'")
             self.manage_localization(ManageLifecycleNodes.Request.STARTUP)
             self.persist_active()
             self.set_state(MapState.ACTIVE, MapState.MODE_LOCALIZATION,
                            f"map '{map_id}' active; localization invalidated")
             self.fire_set_bool(self.safety_hold, False)
             return info
-        except MapFailure:
+        except MapFailure as exc:
             self.set_state(MapState.ERROR, MapState.MODE_LOCALIZATION,
-                           f"failed to activate map '{map_id}'", 'MAP_LOAD_FAILED')
+                           exc.detail, exc.code)
             raise
 
     def set_map_server_yaml(self, path):
@@ -503,6 +573,81 @@ class MapManager(Node):
                              SetParameters.Request(parameters=[parameter]), 'MAP_LOAD_FAILED')
         if not response.results or not response.results[0].successful:
             raise MapFailure('MAP_LOAD_FAILED', 'map_server rejected yaml_filename update')
+
+    def start_mapping(self):
+        self.navigation_hold(True)
+        self.manage_localization(ManageLifecycleNodes.Request.PAUSE)
+        self.slam_start()
+        with self.lock:
+            self.active_map_id = ''
+            self.localization_ready = False
+            self.mapping_unsaved = True
+            self.mapping_saved_id = ''
+        self.set_state(MapState.MAPPING, MapState.MODE_MAPPING, 'SLAM mapping active')
+        self.fire_set_bool(self.safety_hold, False)
+
+    def stop_mapping(self):
+        self.navigation_hold(True)
+        self.slam_stop()
+        self.manage_localization(ManageLifecycleNodes.Request.RESUME)
+        restore = self.previous_map_id or self.default_map_id
+        with self.lock:
+            self.mode = MapState.MODE_LOCALIZATION  # activate() refuses mapping mode
+        self.activate(restore, admitted=True)
+        self.mapping_unsaved = False
+
+    def save_map(self, map_id, display_name, overwrite):
+        temp = ''
+        backup = ''
+        target = self.map_dir(map_id)
+        try:
+            temp = os.path.join(self.maps_dir, f'.tmp-{map_id}-{uuid.uuid4().hex}')
+            os.mkdir(temp)
+            save_prefix = os.path.join(temp, 'map')
+            save_request = SlamSaveMap.Request(name=String(data=save_prefix))
+            result = self.call(self.slam_save, save_request, 'MAP_SAVE_FAILED', timeout=60.0)
+            if result.result != SlamSaveMap.Response.RESULT_SUCCESS:
+                raise MapFailure('MAP_SAVE_FAILED',
+                                 f'slam_toolbox save failed with result {result.result}')
+            self.write_default_walls(temp, map_id)
+            now = iso_now()
+            created = now
+            if os.path.exists(target):
+                try:
+                    with open(os.path.join(target, 'metadata.yaml'), encoding='utf-8') as stream:
+                        created = (yaml.safe_load(stream) or {}).get('created_at', now)
+                    shutil.copy2(os.path.join(target, 'virtual_walls.yaml'),
+                                 os.path.join(temp, 'virtual_walls.yaml'))
+                except OSError:
+                    pass
+                try:
+                    shutil.copy2(os.path.join(target, 'locations.json'),
+                                 os.path.join(temp, 'locations.json'))
+                except OSError:
+                    pass
+            self.write_metadata(temp, map_id, display_name or map_id, created, now)
+            self.validate_dir(temp, expected_id=map_id)
+            if os.path.exists(target):
+                backup = os.path.join(self.maps_dir, f'.old-{map_id}-{uuid.uuid4().hex}')
+                os.replace(target, backup)
+            os.replace(temp, target)
+            temp = ''
+            if backup:
+                shutil.rmtree(backup)
+                backup = ''
+            self.mapping_unsaved = False
+            self.mapping_saved_id = map_id
+            self.set_state(MapState.MAPPING, MapState.MODE_MAPPING,
+                           f"mapping active; saved as '{map_id}'")
+        except MapFailure:
+            raise
+        except Exception as exc:
+            raise MapFailure('MAP_SAVE_FAILED', str(exc)) from exc
+        finally:
+            if temp:
+                shutil.rmtree(temp, ignore_errors=True)
+            if backup and not os.path.exists(target):
+                os.replace(backup, target)
 
     # ---------- services
     def srv_bootstrap(self, _request, response):
@@ -519,19 +664,24 @@ class MapManager(Node):
         return response
 
     def srv_activate(self, request, response):
-        if not self.transition_lock.acquire(blocking=False):
-            response.success, response.error_code = False, 'MAP_TRANSITION'
-            response.message, response.state = 'another map transition is active', self.state_msg()
-            return response
-        try:
-            self.activate(request.map_id)
-            response.success, response.error_code, response.message = True, '', 'map activated'
-        except MapFailure as exc:
-            response.success, response.error_code, response.message = False, exc.code, exc.detail
-        finally:
-            response.state = self.state_msg()
-            self.transition_lock.release()
-        return response
+        def prepare():
+            self.validate_id(request.map_id)
+            self.validate_dir(self.map_dir(request.map_id), expected_id=request.map_id)
+            if self.mode == MapState.MODE_MAPPING:
+                raise MapFailure('MAPPING_ACTIVE', 'stop mapping before activating a saved map')
+            with self.lock:
+                self.active_map_id = request.map_id
+                self.localization_ready = False
+                self.navigation_ready = False
+                self.localization_generation = time.monotonic()
+
+        def failed(exc):
+            self.set_state(MapState.ERROR, MapState.MODE_LOCALIZATION, exc.detail, exc.code)
+
+        return self.admit_transition(
+            response, prepare, MapState.SWITCHING, MapState.MODE_LOCALIZATION,
+            f"switching to map '{request.map_id}'",
+            lambda: self.activate(request.map_id, admitted=True), failed, 'map switch accepted')
 
     def srv_rename(self, request, response):
         if not self.transition_lock.acquire(blocking=False):
@@ -612,72 +762,35 @@ class MapManager(Node):
         return response
 
     def srv_start_mapping(self, _request, response):
-        if not self.transition_lock.acquire(blocking=False):
-            response.success, response.error_code = False, 'MAP_TRANSITION'
-            response.message, response.state = 'another map transition is active', self.state_msg()
-            return response
-        try:
+        def prepare():
             if self.mode == MapState.MODE_MAPPING:
                 raise MapFailure('MAPPING_ACTIVE', 'mapping is already active')
             self.previous_map_id = self.active_map_id
-            self.navigation_hold(True)
-            self.set_state(MapState.SWITCHING, detail='leaving localization mode')
-            self.manage_localization(ManageLifecycleNodes.Request.PAUSE)
-            self.slam_start()
-            with self.lock:
-                self.active_map_id = ''
-                self.localization_ready = False
-                self.mapping_unsaved = True
-                self.mapping_saved_id = ''
-            self.set_state(MapState.MAPPING, MapState.MODE_MAPPING, 'SLAM mapping active')
-            self.fire_set_bool(self.safety_hold, False)
-            response.success, response.error_code, response.message = True, '', 'mapping started'
-        except MapFailure as exc:
+
+        def failed(exc):
             self.set_state(MapState.ERROR, error_code=exc.code, detail=exc.detail)
-            response.success, response.error_code, response.message = False, exc.code, exc.detail
-        finally:
-            response.state = self.state_msg()
-            self.transition_lock.release()
-        return response
+
+        return self.admit_transition(
+            response, prepare, MapState.SWITCHING, None, 'leaving localization mode',
+            self.start_mapping, failed, 'start mapping accepted')
 
     def srv_stop_mapping(self, request, response):
-        if not self.transition_lock.acquire(blocking=False):
-            response.success, response.error_code = False, 'MAP_TRANSITION'
-            response.message, response.state = 'another map transition is active', self.state_msg()
-            return response
-        try:
+        def prepare():
             if self.mode != MapState.MODE_MAPPING:
                 raise MapFailure('NOT_MAPPING', 'mapping is not active')
             if self.mapping_unsaved and not request.discard_unsaved:
                 raise MapFailure('UNSAVED_MAP',
                                  'mapping has unsaved changes; save or explicitly discard')
-            self.navigation_hold(True)
-            self.set_state(MapState.SWITCHING, detail='stopping SLAM mapping')
-            self.slam_stop()
-            self.manage_localization(ManageLifecycleNodes.Request.RESUME)
-            restore = self.previous_map_id or self.default_map_id
-            with self.lock:
-                self.mode = MapState.MODE_LOCALIZATION  # activate() refuses to run in mapping mode
-            self.activate(restore)
-            self.mapping_unsaved = False
-            response.success, response.error_code, response.message = True, '', 'mapping stopped'
-        except MapFailure as exc:
-            if exc.code not in ('UNSAVED_MAP', 'NOT_MAPPING'):
-                self.set_state(MapState.ERROR, error_code=exc.code, detail=exc.detail)
-            response.success, response.error_code, response.message = False, exc.code, exc.detail
-        finally:
-            response.state = self.state_msg()
-            self.transition_lock.release()
-        return response
+
+        def failed(exc):
+            self.set_state(MapState.ERROR, error_code=exc.code, detail=exc.detail)
+
+        return self.admit_transition(
+            response, prepare, MapState.SWITCHING, None, 'stopping SLAM mapping',
+            self.stop_mapping, failed, 'stop mapping accepted')
 
     def srv_save(self, request, response):
-        if not self.transition_lock.acquire(blocking=False):
-            response.success, response.error_code = False, 'MAP_TRANSITION'
-            response.message = 'another map transition is active'
-            return response
-        temp = ''
-        backup = ''
-        try:
+        def prepare():
             if self.mode != MapState.MODE_MAPPING or self.state != MapState.MAPPING:
                 raise MapFailure('NOT_MAPPING', 'map saving requires active mapping')
             self.validate_id(request.map_id)
@@ -685,63 +798,15 @@ class MapManager(Node):
             if os.path.exists(target) and not request.overwrite:
                 raise MapFailure('MAP_ALREADY_EXISTS',
                                  f"map '{request.map_id}' already exists; overwrite is false")
-            self.set_state(MapState.SAVING, detail=f"saving map '{request.map_id}'")
-            temp = os.path.join(self.maps_dir, f'.tmp-{request.map_id}-{uuid.uuid4().hex}')
-            os.mkdir(temp)
-            save_prefix = os.path.join(temp, 'map')
-            save_request = SlamSaveMap.Request(name=String(data=save_prefix))
-            result = self.call(self.slam_save, save_request, 'MAP_SAVE_FAILED', timeout=60.0)
-            if result.result != SlamSaveMap.Response.RESULT_SUCCESS:
-                raise MapFailure('MAP_SAVE_FAILED',
-                                 f'slam_toolbox save failed with result {result.result}')
-            self.write_default_walls(temp, request.map_id)
-            now = iso_now()
-            created = now
-            if os.path.exists(target):
-                try:
-                    with open(os.path.join(target, 'metadata.yaml'), encoding='utf-8') as stream:
-                        created = (yaml.safe_load(stream) or {}).get('created_at', now)
-                    shutil.copy2(os.path.join(target, 'virtual_walls.yaml'),
-                                 os.path.join(temp, 'virtual_walls.yaml'))
-                except OSError:
-                    pass
-                try:
-                    shutil.copy2(os.path.join(target, 'locations.json'),
-                                 os.path.join(temp, 'locations.json'))
-                except OSError:
-                    pass
-            self.write_metadata(temp, request.map_id, request.display_name or request.map_id,
-                                created, now)
-            info = self.validate_dir(temp, expected_id=request.map_id)
-            if os.path.exists(target):
-                backup = os.path.join(self.maps_dir, f'.old-{request.map_id}-{uuid.uuid4().hex}')
-                os.replace(target, backup)
-            os.replace(temp, target)
-            temp = ''
-            if backup:
-                shutil.rmtree(backup)
-                backup = ''
-            self.mapping_unsaved = False
-            self.mapping_saved_id = request.map_id
-            self.set_state(MapState.MAPPING, MapState.MODE_MAPPING,
-                           f"mapping active; saved as '{request.map_id}'")
-            response.success, response.error_code, response.message = True, '', 'map saved'
-            response.map = info
-        except MapFailure as exc:
+
+        def failed(exc):
             self.set_state(MapState.MAPPING if self.mode == MapState.MODE_MAPPING else MapState.ERROR,
                            error_code=exc.code, detail=exc.detail)
-            response.success, response.error_code, response.message = False, exc.code, exc.detail
-        except Exception as exc:
-            self.set_state(MapState.MAPPING, error_code='MAP_SAVE_FAILED', detail=str(exc))
-            response.success, response.error_code = False, 'MAP_SAVE_FAILED'
-            response.message = str(exc)
-        finally:
-            if temp:
-                shutil.rmtree(temp, ignore_errors=True)
-            if backup and not os.path.exists(self.map_dir(request.map_id)):
-                os.replace(backup, self.map_dir(request.map_id))
-            self.transition_lock.release()
-        return response
+
+        return self.admit_transition(
+            response, prepare, MapState.SAVING, None, f"saving map '{request.map_id}'",
+            lambda: self.save_map(request.map_id, request.display_name, request.overwrite),
+            failed, 'save map accepted')
 
 
 def main():
@@ -758,6 +823,17 @@ def main():
         if rclpy.ok():
             raise
     finally:
+        node.shutting_down = True
+        if node.transition_thread is not None and node.transition_thread.is_alive():
+            node.get_logger().warning('waiting for active map transition before shutdown')
+        while True:
+            worker = node.transition_thread
+            if worker is None or not worker.is_alive():
+                break
+            while worker.is_alive():
+                if rclpy.ok():
+                    executor.spin_once(timeout_sec=0.1)
+                worker.join(timeout=0.1)
         executor.shutdown(timeout_sec=2.0)
         node.destroy_node()
         rclpy.try_shutdown()

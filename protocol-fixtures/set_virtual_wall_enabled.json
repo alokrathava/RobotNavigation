@@ -1,0 +1,1 @@
+{"type":"set_virtual_wall_enabled","id":"cmd-enable-wall","protocolVersion":1,"payload":{"wallId":"wall-1","enabled":false}}

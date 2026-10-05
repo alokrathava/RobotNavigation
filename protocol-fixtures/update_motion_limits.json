@@ -1,0 +1,1 @@
+{"type":"update_motion_limits","id":"cmd-limits","protocolVersion":1,"payload":{"limits":{"maxLinearVelocityMps":0.4,"maxAngularVelocityRadPerSec":1.0}}}

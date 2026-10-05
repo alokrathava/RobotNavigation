@@ -23,6 +23,11 @@ GATEWAY="true"
 GATEWAY_HOST="127.0.0.1"
 GATEWAY_PORT="8080"
 GATEWAY_TOKEN="${ROBOT_GATEWAY_TOKEN:-}"
+ROBOT_ID="${ROBOT_ID:-}"
+ROBOT_NAME="${ROBOT_NAME:-}"
+GATEWAY_DISCOVERY="${ROBOT_DISCOVERY_MODE:-auto}"
+DISCOVERY_PORT="8088"
+DISCOVERY_INTERVAL="1.0"
 MAPS_DIR="$HOME/.robot/maps"
 CLEAN=0
 STATUS=0
@@ -41,6 +46,11 @@ Usage: ./run.sh [options]
   --gateway-port PORT      gateway port (default: 8080)
   --gateway-token TOKEN    gateway auth token; required when the host is not loopback. The flag
                            is visible in `ps`: prefer `export ROBOT_GATEWAY_TOKEN=...`
+  --robot-id ID            stable discovery identity (default: ROBOT_ID or hostname)
+  --robot-name NAME        discovery display name (default: ROBOT_NAME or robot ID)
+  --gateway-discovery MODE auto, on, or off (default: auto; on for non-loopback gateways)
+  --discovery-port PORT    UDP discovery destination port (default: 8088)
+  --discovery-interval SEC seconds between discovery beacons (default: 1.0)
   --maps-dir PATH          runtime map root (default: ~/.robot/maps)
   --clean                  stop a previous RobotNavigation run owned by this script first
   --status                 show whether RobotNavigation is running
@@ -67,6 +77,11 @@ while [[ $# -gt 0 ]]; do
         --gateway-host)  need_arg "$@"; GATEWAY_HOST="$2"; shift 2 ;;
         --gateway-port)  need_arg "$@"; GATEWAY_PORT="$2"; shift 2 ;;
         --gateway-token) need_arg "$@"; GATEWAY_TOKEN="$2"; shift 2 ;;
+        --robot-id)      need_arg "$@"; ROBOT_ID="$2"; shift 2 ;;
+        --robot-name)    need_arg "$@"; ROBOT_NAME="$2"; shift 2 ;;
+        --gateway-discovery) need_arg "$@"; GATEWAY_DISCOVERY="$2"; shift 2 ;;
+        --discovery-port) need_arg "$@"; DISCOVERY_PORT="$2"; shift 2 ;;
+        --discovery-interval) need_arg "$@"; DISCOVERY_INTERVAL="$2"; shift 2 ;;
         --maps-dir)      need_arg "$@"; MAPS_DIR="$2"; shift 2 ;;
         --clean)         CLEAN=1; shift ;;
         --status)        STATUS=1; shift ;;
@@ -487,6 +502,12 @@ fi
 [[ "$MODE" == "navigation" || "$MODE" == "mapping" ]] || die "--mode must be navigation or mapping"
 [[ "$GATEWAY_PORT" =~ ^[0-9]+$ && "$GATEWAY_PORT" -ge 1 && "$GATEWAY_PORT" -le 65535 ]] \
     || die "--gateway-port must be 1-65535"
+[[ "$DISCOVERY_PORT" =~ ^[0-9]+$ && "$DISCOVERY_PORT" -ge 1 && "$DISCOVERY_PORT" -le 65535 ]] \
+    || die "--discovery-port must be 1-65535"
+[[ "$DISCOVERY_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ && "$DISCOVERY_INTERVAL" != "0" && "$DISCOVERY_INTERVAL" != "0.0" ]] \
+    || die "--discovery-interval must be a positive number"
+[[ "$GATEWAY_DISCOVERY" == "auto" || "$GATEWAY_DISCOVERY" == "on" || "$GATEWAY_DISCOVERY" == "off" ]] \
+    || die "--gateway-discovery must be auto, on, or off"
 [[ "$STARTUP_TIMEOUT" =~ ^[0-9]+$ ]] || die "ROBOT_STARTUP_TIMEOUT must be an integer"
 MAPS_DIR="${MAPS_DIR/#\~/$HOME}"
 [[ "$MAPS_DIR" == /* ]] || MAPS_DIR="$PWD/$MAPS_DIR"
@@ -612,6 +633,7 @@ info "      Backend:     $BACKEND   Mode: $MODE"
 info "      Maps dir:    $MAPS_DIR"
 if [[ "$GATEWAY" == "true" ]]; then
     info "      Gateway:     $GATEWAY_HOST:$GATEWAY_PORT"
+    info "      Discovery:   $GATEWAY_DISCOVERY (UDP $DISCOVERY_PORT, every ${DISCOVERY_INTERVAL}s)"
     if [[ -n "$GATEWAY_TOKEN" ]]; then info "      Gateway token: configured"; else info "      Gateway token: none (loopback only)"; fi
 else
     info "      Gateway:     disabled"
@@ -619,7 +641,10 @@ fi
 info "      Log:         $LOG"
 
 launch_args=(backend:="$BACKEND" mode:="$MODE" maps_dir:="$MAPS_DIR" rviz:="$RVIZ"
-             gateway:="$GATEWAY" gateway_host:="$GATEWAY_HOST" gateway_port:="$GATEWAY_PORT")
+             gateway:="$GATEWAY" gateway_host:="$GATEWAY_HOST" gateway_port:="$GATEWAY_PORT"
+             robot_id:="$ROBOT_ID" robot_name:="$ROBOT_NAME"
+             gateway_discovery:="$GATEWAY_DISCOVERY" discovery_port:="$DISCOVERY_PORT"
+             discovery_interval:="$DISCOVERY_INTERVAL")
 if ((HEADLESS)) && [[ "$BACKEND" == "sim" ]]; then launch_args+=(headless:=-s); fi
 
 : >"$LOG"

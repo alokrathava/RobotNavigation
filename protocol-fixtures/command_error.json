@@ -1,0 +1,1 @@
+{"type":"command_error","id":"cmd-error","protocolVersion":1,"error":{"code":"CONTROL_SESSION_IN_USE","subsystem":"gateway","severity":"ERROR","message":"Control session currently held by another client","recoverable":true}}

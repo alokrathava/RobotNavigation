@@ -1,0 +1,1 @@
+{"type":"get_recent_logs","id":"cmd-logs","protocolVersion":1,"payload":{"limit":10}}

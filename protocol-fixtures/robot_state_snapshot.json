@@ -1,0 +1,1 @@
+{"type":"robot_state_snapshot","id":"cmd-snapshot","protocolVersion":1,"payload":{"telemetry":null,"battery":null,"safety":null,"docking":null,"health":null,"mapState":{"state":"ACTIVE","mode":"LOCALIZATION","activeMapId":"main_floor","mapAvailable":true,"localizationReady":true,"navigationRuntimeReady":true,"errorCode":"","detail":"map active"}}}

@@ -64,6 +64,75 @@ class _DispatchHarness:
         self.service_calls.append((msg_id, service, label))
 
 
+class _WebSocket:
+    def __init__(self):
+        self.messages = []
+
+    async def send(self, text):
+        self.messages.append(json.loads(text))
+
+
+class _NavigateThroughHarness:
+    def __init__(self):
+        self.errors = []
+        self.sent = []
+        self.nav_through_client = object()
+
+    async def send_error(self, _ws, msg_id, code, message, **_kwargs):
+        self.errors.append((msg_id, code, message))
+
+    @staticmethod
+    def _pose_stamped(point):
+        return gateway_node.PoseStamped()
+
+    @staticmethod
+    def _goal_summary(point):
+        return point
+
+    async def _send_nav_goal(self, _ws, msg_id, nav_type, client, goal, goals, frame):
+        self.sent.append((msg_id, nav_type, client, goal, goals, frame))
+
+
+class _CompletedFuture:
+    def __init__(self, result):
+        self._result = result
+
+    def done(self):
+        return True
+
+    def result(self):
+        return self._result
+
+
+class _ServiceClient:
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+
+    def service_is_ready(self):
+        return True
+
+    def call_async(self, request):
+        self.requests.append(request)
+        return _CompletedFuture(self.response)
+
+
+class _MapCommandHarness:
+    def __init__(self, response):
+        self.srv_save_map = _ServiceClient(response)
+        self.acks = []
+        self.errors = []
+
+    async def _await_future(self, future, timeout=10.0):
+        return future.result()
+
+    async def send_ack(self, _ws, msg_id):
+        self.acks.append(msg_id)
+
+    async def send_error(self, _ws, msg_id, code, message, **_kwargs):
+        self.errors.append((msg_id, code, message))
+
+
 class TestManualVelocityValidation(unittest.IsolatedAsyncioTestCase):
     async def _send(self, payload, limits=None, limits_available=True):
         harness = _ManualVelocityHarness(limits, limits_available)
@@ -179,6 +248,138 @@ class TestEmergencyStopOwnership(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("CONTROL_SESSION_REQUIRED", harness.errors[0][1])
         self.assertEqual([], harness.service_calls)
+
+
+class TestProtocolContract(unittest.IsolatedAsyncioTestCase):
+    def test_discovery_auto_mode_only_enables_for_lan_gateway(self):
+        self.assertFalse(gateway_node.discovery_is_enabled("127.0.0.1", "auto"))
+        self.assertTrue(gateway_node.discovery_is_enabled("0.0.0.0", "auto"))
+        self.assertFalse(gateway_node.discovery_is_enabled("0.0.0.0", "off"))
+        self.assertTrue(gateway_node.discovery_is_enabled("127.0.0.1", "on"))
+
+    def test_discovery_beacon_matches_android_wire_contract(self):
+        beacon = gateway_node.discovery_beacon("robot-01", "Robot 01", 8080)
+
+        self.assertEqual("robot_discovery_beacon", beacon["type"])
+        self.assertEqual("robot-01", beacon["robotId"])
+        self.assertEqual(8080, beacon["port"])
+        self.assertEqual(beacon["port"], beacon["gatewayPort"])
+        self.assertFalse(beacon["tls"])
+
+    async def test_discovery_loop_broadcasts_and_closes_its_socket(self):
+        class FakeSocket:
+            def __init__(self):
+                self.options = []
+                self.blocking = None
+                self.closed = False
+
+            def setsockopt(self, *option):
+                self.options.append(option)
+
+            def setblocking(self, blocking):
+                self.blocking = blocking
+
+            def close(self):
+                self.closed = True
+
+        class FakeLoop:
+            def __init__(self):
+                self.sent = []
+
+            async def sock_sendto(self, udp_socket, message, target):
+                self.sent.append((udp_socket, json.loads(message), target))
+                raise asyncio.CancelledError
+
+        fake_socket = FakeSocket()
+        fake_loop = FakeLoop()
+        original_socket = gateway_node.socket.socket
+        original_get_running_loop = gateway_node.asyncio.get_running_loop
+        gateway_node.socket.socket = lambda *_args: fake_socket
+        gateway_node.asyncio.get_running_loop = lambda: fake_loop
+        harness = SimpleNamespace(
+            robot_id="robot-01", robot_name="Robot 01", port=8080,
+            discovery_port=8088, discovery_interval=1.0,
+        )
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await gateway_node._discovery_loop(harness)
+        finally:
+            gateway_node.socket.socket = original_socket
+            gateway_node.asyncio.get_running_loop = original_get_running_loop
+
+        self.assertEqual(("255.255.255.255", 8088), fake_loop.sent[0][2])
+        self.assertEqual("robot_discovery_beacon", fake_loop.sent[0][1]["type"])
+        self.assertFalse(fake_socket.blocking)
+        self.assertTrue(fake_socket.closed)
+
+    async def test_snapshot_uses_map_state_schema(self):
+        map_state = {
+            "state": "ACTIVE", "mode": "LOCALIZATION", "activeMapId": "main_floor",
+            "mapAvailable": True, "localizationReady": True,
+            "navigationRuntimeReady": True, "errorCode": "", "detail": "ready",
+        }
+        harness = SimpleNamespace(
+            last_telemetry=None, last_battery=None, last_safety=None,
+            last_docking=None, last_health=None, last_map_state=map_state,
+        )
+        websocket = _WebSocket()
+
+        await RobotGatewayNode.handle_request_state_snapshot(harness, websocket, "snapshot-1")
+
+        payload = websocket.messages[0]["payload"]
+        self.assertNotIn("map", payload)
+        self.assertEqual(map_state, payload["mapState"])
+
+    async def test_navigate_through_defaults_to_stop_on_failure(self):
+        harness = _NavigateThroughHarness()
+
+        await RobotGatewayNode.handle_navigate_through(
+            harness, object(), "nav-1",
+            {"waypoints": [{"xMeters": 1.0, "yMeters": 2.0, "yawRadians": 0.0}]})
+
+        self.assertEqual([], harness.errors)
+        self.assertEqual(1, len(harness.sent))
+
+    async def test_navigate_through_rejects_false_stop_on_failure(self):
+        harness = _NavigateThroughHarness()
+
+        await RobotGatewayNode.handle_navigate_through(
+            harness, object(), "nav-1",
+            {"waypoints": [{"xMeters": 1.0}], "stopOnFailure": False})
+
+        self.assertEqual("UNSUPPORTED_ARGUMENT", harness.errors[0][1])
+        self.assertEqual([], harness.sent)
+
+    async def test_navigate_through_rejects_non_boolean_stop_on_failure(self):
+        harness = _NavigateThroughHarness()
+
+        await RobotGatewayNode.handle_navigate_through(
+            harness, object(), "nav-1",
+            {"waypoints": [{"xMeters": 1.0}], "stopOnFailure": "true"})
+
+        self.assertEqual("INVALID_ARGUMENT", harness.errors[0][1])
+        self.assertEqual([], harness.sent)
+
+    async def test_save_map_acknowledges_admission_without_a_typed_result(self):
+        harness = _MapCommandHarness(SimpleNamespace(success=True, message="accepted"))
+        websocket = _WebSocket()
+
+        await RobotGatewayNode.handle_save_map(
+            harness, websocket, "save-1", {"name": "Warehouse A"})
+
+        self.assertEqual(["save-1"], harness.acks)
+        self.assertEqual([], websocket.messages)
+        self.assertEqual([], harness.errors)
+
+    async def test_save_map_reports_admission_rejection(self):
+        harness = _MapCommandHarness(SimpleNamespace(
+            success=False, error_code="MAP_TRANSITION", message="busy"))
+
+        await RobotGatewayNode.handle_save_map(
+            harness, _WebSocket(), "save-1", {"name": "Warehouse A"})
+
+        self.assertEqual([], harness.acks)
+        self.assertEqual("MAP_TRANSITION", harness.errors[0][1])
 
 
 if __name__ == "__main__":

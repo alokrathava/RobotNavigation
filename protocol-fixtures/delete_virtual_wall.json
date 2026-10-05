@@ -1,0 +1,1 @@
+{"type":"delete_virtual_wall","id":"cmd-delete-wall","protocolVersion":1,"payload":{"wallId":"wall-1"}}
