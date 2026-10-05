@@ -1,0 +1,1 @@
+{"type":"create_virtual_wall_ack","id":"cmd-create-wall","protocolVersion":1,"payload":{"wall":{"id":"wall-1","mapId":"main_floor","name":"Keepout","type":"LINE","points":[{"xMeters":0.0,"yMeters":0.0},{"xMeters":5.0,"yMeters":0.0}],"thicknessMeters":0.2,"enabled":true}}}

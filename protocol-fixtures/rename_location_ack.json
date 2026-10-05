@@ -1,0 +1,1 @@
+{"type":"rename_location_ack","id":"cmd-rename-location","protocolVersion":1,"payload":{"location":{"id":"location-1","name":"Front Desk","mapId":"main_floor","xMeters":2.5,"yMeters":1.0,"yawRadians":0.0}}}

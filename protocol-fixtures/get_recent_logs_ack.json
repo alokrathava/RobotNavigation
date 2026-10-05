@@ -1,0 +1,1 @@
+{"type":"get_recent_logs_ack","id":"cmd-logs","protocolVersion":1,"payload":{"logs":[{"timestampEpochMs":1700000000000,"level":"INFO","logger":"robot_gateway","message":"ready"}]}}

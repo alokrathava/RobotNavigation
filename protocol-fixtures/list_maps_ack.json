@@ -1,0 +1,1 @@
+{"type":"list_maps_ack","id":"cmd-list-maps","protocolVersion":1,"payload":{"maps":[{"id":"main_floor","name":"Main Floor","isActive":true,"resolution":0.05,"width":200,"height":200}]}}

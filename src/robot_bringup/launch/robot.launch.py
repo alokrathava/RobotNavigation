@@ -5,7 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -61,7 +61,12 @@ def generate_launch_description():
         # The token is read from $ROBOT_GATEWAY_TOKEN when set, keeping it off the command line.
         arguments=['--host', LaunchConfiguration('gateway_host'),
                    '--port', LaunchConfiguration('gateway_port'),
-                   '--auth-token', LaunchConfiguration('gateway_token')],
+                   '--auth-token', LaunchConfiguration('gateway_token'),
+                   '--robot-id', LaunchConfiguration('robot_id'),
+                   '--robot-name', LaunchConfiguration('robot_name'),
+                   '--discovery', LaunchConfiguration('gateway_discovery'),
+                   '--discovery-port', LaunchConfiguration('discovery_port'),
+                   '--discovery-interval', LaunchConfiguration('discovery_interval')],
         condition=IfCondition(LaunchConfiguration('gateway')),
     )
 
@@ -81,6 +86,28 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'gateway_token', default_value='',
             description='WebSocket gateway auth token (empty: none required)',
+        ),
+        DeclareLaunchArgument(
+            'robot_id', default_value=EnvironmentVariable('ROBOT_ID', default_value=''),
+            description='Stable UDP discovery identity (empty: ROBOT_ID or hostname)',
+        ),
+        DeclareLaunchArgument(
+            'robot_name', default_value=EnvironmentVariable('ROBOT_NAME', default_value=''),
+            description='UDP discovery display name (empty: ROBOT_NAME or robot id)',
+        ),
+        DeclareLaunchArgument(
+            'gateway_discovery',
+            default_value=EnvironmentVariable('ROBOT_DISCOVERY_MODE', default_value='auto'),
+            choices=['auto', 'on', 'off'],
+            description='UDP discovery mode; auto enables it for non-loopback gateways',
+        ),
+        DeclareLaunchArgument(
+            'discovery_port', default_value='8088',
+            description='UDP discovery beacon destination port',
+        ),
+        DeclareLaunchArgument(
+            'discovery_interval', default_value='1.0',
+            description='Seconds between UDP discovery beacons',
         ),
         DeclareLaunchArgument(
             'backend', default_value='sim', choices=['sim', 'hardware'],

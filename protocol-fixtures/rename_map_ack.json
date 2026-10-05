@@ -1,0 +1,1 @@
+{"type":"rename_map_ack","id":"cmd-rename-map","protocolVersion":1,"payload":{"map":{"id":"main_floor","name":"Main Floor","isActive":true,"resolution":0.05,"width":200,"height":200}}}

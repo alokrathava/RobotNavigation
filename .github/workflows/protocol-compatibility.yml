@@ -1,0 +1,90 @@
+name: Protocol compatibility
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/protocol-compatibility.yml'
+      - 'ci/android/**'
+      - 'protocol-fixtures/**'
+      - 'src/robot_gateway/**'
+      - 'src/robot_interfaces/**'
+      - 'src/robot_navigation/**'
+  push:
+    branches: [main, feature/gateway-ros-wiring]
+  workflow_dispatch:
+    inputs:
+      robot_controller_ref:
+        description: Robot-Controller git ref
+        required: false
+        default: master
+  workflow_call:
+    inputs:
+      robot_controller_ref:
+        description: Robot-Controller git ref
+        required: false
+        type: string
+        default: master
+    secrets:
+      robot_controller_token:
+        required: false
+
+jobs:
+  robot-navigation:
+    name: ROS contract tests
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:resolute
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: lyrical
+      - name: Install package dependencies
+        run: |
+          rosdep update
+          rosdep install --from-paths src --ignore-src --rosdistro lyrical -y
+      - name: Build contract packages
+        shell: bash
+        run: |
+          source /opt/ros/lyrical/setup.bash
+          colcon build --packages-up-to robot_gateway robot_navigation --symlink-install
+      - name: Run contract tests
+        shell: bash
+        run: |
+          source /opt/ros/lyrical/setup.bash
+          source install/setup.bash
+          colcon test --packages-select robot_gateway robot_navigation --event-handlers console_direct+
+          colcon test-result --verbose
+
+  android-codec:
+    name: Kotlin codec compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout RobotNavigation
+        uses: actions/checkout@v4
+        with:
+          path: RobotNavigation
+      - name: Checkout Robot-Controller
+        uses: actions/checkout@v4
+        with:
+          repository: alokrathava/Robot-Controller
+          ref: ${{ inputs.robot_controller_ref || 'master' }}
+          token: ${{ secrets.robot_controller_token || github.token }}
+          path: Robot-Controller
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: Robot-Controller/**/*.gradle*
+      - name: Install canonical fixtures and compatibility test
+        run: |
+          rm -rf Robot-Controller/protocol-fixtures
+          cp -R RobotNavigation/protocol-fixtures Robot-Controller/protocol-fixtures
+          cp RobotNavigation/ci/android/RobotNavigationProtocolContractTest.kt \
+            Robot-Controller/robot/sdk/src/test/java/com/alokrathava/sdk/
+          chmod +x Robot-Controller/gradlew
+      - name: Run Robot SDK protocol tests
+        working-directory: Robot-Controller
+        run: ./gradlew :robot:sdk:testDebugUnitTest --stacktrace

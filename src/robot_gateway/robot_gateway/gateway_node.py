@@ -15,6 +15,7 @@ import math
 import os
 import re
 import signal
+import socket
 import sys
 import time
 import uuid
@@ -42,16 +43,23 @@ from unique_identifier_msgs.msg import UUID as UuidMsg
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
 
+from robot_gateway.protocol_contract import (
+    GATEWAY_CAPABILITIES,
+    GATEWAY_VERSION,
+    PROTOCOL_VERSION,
+)
+
 LOGGER = logging.getLogger("robot_gateway")
-PROTOCOL_VERSION = 1
 RECENT_LOG_CAPACITY = 500
 SPIN_BATCH = 25
 LOG_LEVEL_NAMES = {10: "DEBUG", 20: "INFO", 30: "WARN", 40: "ERROR", 50: "ERROR"}  # FATAL -> ERROR (SDK has no FATAL)
-MAP_TRANSITION_TIMEOUT = 120.0  # lifecycle cycles (RESET/STARTUP, SLAM save) can take tens of seconds
+MAP_ADMISSION_TIMEOUT = 10.0
 MAX_MESSAGE_SIZE_BYTES = 5_000_000  # 5 MB payload limit
 NAV_GOAL_RESPONSE_TIMEOUT_S = 10.0
 NAV_CANCEL_WAIT_S = 5.0  # bounded wait for a cancelled navigator to reach a terminal state
 LOOP_LAG_PERIOD_S = 0.1
+DEFAULT_DISCOVERY_PORT = 8088
+DEFAULT_DISCOVERY_INTERVAL_S = 1.0
 SLOW_RESPONSE_WARN_S = 1.0  # pending goal response age that triggers a diagnostic warning
 METRIC_WINDOW_S = 1.0
 METRIC_WINDOWS_KEPT = 120
@@ -80,6 +88,27 @@ def _finite(value):
 def safe_dumps(obj, **kwargs) -> str:
     """json.dumps that emits null for NaN/Inf so strict JSON parsers (Kotlin) accept it."""
     return json.dumps(_finite(obj), allow_nan=False, **kwargs)
+
+
+def discovery_is_enabled(host: str, mode: str) -> bool:
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    return not _is_loopback(host)
+
+
+def discovery_beacon(robot_id: str, name: str, gateway_port: int) -> Dict[str, Any]:
+    return {
+        "type": "robot_discovery_beacon",
+        "protocolVersion": PROTOCOL_VERSION,
+        "robotId": robot_id,
+        "name": name,
+        "port": gateway_port,
+        "gatewayPort": gateway_port,
+        "gatewayVersion": GATEWAY_VERSION,
+        "tls": False,
+    }
 
 
 class NavSendResult:
@@ -173,11 +202,20 @@ def dict_to_ros_wall(wall_dict: Dict[str, Any]) -> RosVirtualWall:
 
 
 class RobotGatewayNode(Node):
-    def __init__(self, host: str, port: int, auth_token: str = ""):
+    def __init__(self, host: str, port: int, auth_token: str = "", *,
+                 robot_id: str = "", robot_name: str = "", discovery_mode: str = "auto",
+                 discovery_port: int = DEFAULT_DISCOVERY_PORT,
+                 discovery_interval: float = DEFAULT_DISCOVERY_INTERVAL_S):
         super().__init__("robot_gateway")
         self.host = host
         self.port = port
         self.auth_token = auth_token
+        self.robot_id = robot_id or socket.gethostname()
+        self.robot_name = robot_name or self.robot_id
+        self.discovery_mode = discovery_mode
+        self.discovery_port = discovery_port
+        self.discovery_interval = discovery_interval
+        self.discovery_enabled = discovery_is_enabled(host, discovery_mode)
         self.maps_dir = os.path.realpath(os.path.expanduser(
             self.declare_parameter("maps_dir", "~/.robot/maps").value))
 
@@ -689,26 +727,8 @@ class RobotGatewayNode(Node):
             "id": msg_id,
             "protocolVersion": PROTOCOL_VERSION,
             "payload": {
-                "gatewayVersion": "0.2.0",
-                "capabilities": [
-                    "navigation",
-                    "manual_control",
-                    "docking",
-                    "safety",
-                    "telemetry",
-                    "battery",
-                    "health",
-                    "map_switching",
-                    "map_management",
-                    "mapping",
-                    "virtual_walls",
-                    "saved_locations",
-                    "waypoint_navigation",
-                    "missions",
-                    "robot_configuration",
-                    "diagnostics",
-                    "log_retrieval"
-                ],
+                "gatewayVersion": GATEWAY_VERSION,
+                "capabilities": list(GATEWAY_CAPABILITIES),
                 "sessionId": session_id
             }
         }
@@ -992,9 +1012,23 @@ class RobotGatewayNode(Node):
                                   [self._goal_summary(payload)], goal_msg.pose.header.frame_id)
 
     async def handle_navigate_through(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
+        if not isinstance(payload, dict):
+            await self.send_error(ws, msg_id, "INVALID_ARGUMENT", "Navigate-through payload must be an object")
+            return
+
         waypoints_data = payload.get("waypoints", [])
         if not waypoints_data:
             await self.send_error(ws, msg_id, "INVALID_ARGUMENT", "Waypoints list cannot be empty")
+            return
+
+        stop_on_failure = payload.get("stopOnFailure", True)
+        if not isinstance(stop_on_failure, bool):
+            await self.send_error(ws, msg_id, "INVALID_ARGUMENT", "stopOnFailure must be a Boolean")
+            return
+        if not stop_on_failure:
+            await self.send_error(
+                ws, msg_id, "UNSUPPORTED_ARGUMENT",
+                "Protocol v1 supports navigate_through only with stopOnFailure=true")
             return
 
         goal_msg = NavigateThroughPoses.Goal()
@@ -1052,7 +1086,8 @@ class RobotGatewayNode(Node):
 
         req = ActivateMap.Request()
         req.map_id = map_id
-        res = await self._await_future(self.srv_switch_map.call_async(req), timeout=MAP_TRANSITION_TIMEOUT)
+        res = await self._await_future(
+            self.srv_switch_map.call_async(req), timeout=MAP_ADMISSION_TIMEOUT)
         if res and res.success:
             await self.send_ack(ws, msg_id)
         else:
@@ -1078,17 +1113,10 @@ class RobotGatewayNode(Node):
         req.map_id = map_id
         req.display_name = name
         req.overwrite = True
-        res = await self._await_future(self.srv_save_map.call_async(req), timeout=MAP_TRANSITION_TIMEOUT)
+        res = await self._await_future(
+            self.srv_save_map.call_async(req), timeout=MAP_ADMISSION_TIMEOUT)
         if res and res.success:
-            resp = {
-                "type": "save_map_ack",
-                "id": msg_id,
-                "protocolVersion": PROTOCOL_VERSION,
-                "payload": {
-                    "map": map_info_to_dict(res.map)
-                }
-            }
-            await ws.send(safe_dumps(resp))
+            await self.send_ack(ws, msg_id)
         else:
             msg = res.message if res else "Save map failed"
             await self.send_error(ws, msg_id, (res.error_code if res else "") or "MAP_SAVE_FAILED", msg)
@@ -1150,7 +1178,7 @@ class RobotGatewayNode(Node):
             return
 
         res = await self._await_future(
-            self.srv_start_mapping.call_async(StartMapping.Request()), timeout=MAP_TRANSITION_TIMEOUT)
+            self.srv_start_mapping.call_async(StartMapping.Request()), timeout=MAP_ADMISSION_TIMEOUT)
         if res and res.success:
             await self.send_ack(ws, msg_id)
         else:
@@ -1165,7 +1193,7 @@ class RobotGatewayNode(Node):
         req = StopMapping.Request()
         req.discard_unsaved = bool(payload.get("discardUnsaved", False))
         res = await self._await_future(
-            self.srv_stop_mapping.call_async(req), timeout=MAP_TRANSITION_TIMEOUT)
+            self.srv_stop_mapping.call_async(req), timeout=MAP_ADMISSION_TIMEOUT)
         if res and res.success:
             await self.send_ack(ws, msg_id)
         else:
@@ -1845,7 +1873,7 @@ class RobotGatewayNode(Node):
             "safety": self.last_safety,
             "docking": self.last_docking,
             "health": self.last_health,
-            "map": self.last_map_state
+            "mapState": self.last_map_state
         }
         resp = {
             "type": "robot_state_snapshot",
@@ -1923,6 +1951,31 @@ async def _monitor_loop(node: RobotGatewayNode):
                         closed["max_spin_batch"], closed["max_spin_once"], closed["max_loop_lag"])
 
 
+async def _discovery_loop(node: RobotGatewayNode):
+    message = safe_dumps(discovery_beacon(node.robot_id, node.robot_name, node.port)).encode("utf-8")
+    target = ("255.255.255.255", node.discovery_port)
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    udp_socket.setblocking(False)
+    loop = asyncio.get_running_loop()
+    last_warning = 0.0
+    LOGGER.info(
+        "Robot discovery broadcasting robot_id=%s UDP %s:%d every %.1fs",
+        node.robot_id, target[0], target[1], node.discovery_interval)
+    try:
+        while True:
+            try:
+                await loop.sock_sendto(udp_socket, message, target)
+            except (OSError, RuntimeError) as exc:
+                now = time.monotonic()
+                if now - last_warning >= 60.0:
+                    LOGGER.warning("Robot discovery beacon send failed: %s", exc)
+                    last_warning = now
+            await asyncio.sleep(node.discovery_interval)
+    finally:
+        udp_socket.close()
+
+
 async def run_gateway(node: RobotGatewayNode):
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1934,6 +1987,7 @@ async def run_gateway(node: RobotGatewayNode):
             pass
 
     monitor = asyncio.create_task(_monitor_loop(node))
+    discovery = asyncio.create_task(_discovery_loop(node)) if node.discovery_enabled else None
     async with serve(node.handle_client, node.host, node.port):
         LOGGER.info("Robot Gateway listening on ws://%s:%d", node.host, node.port)
         last_batch_start = time.monotonic()
@@ -1951,6 +2005,12 @@ async def run_gateway(node: RobotGatewayNode):
             await asyncio.sleep(0.01)
         LOGGER.info("Robot Gateway shutting down")
     monitor.cancel()
+    if discovery is not None:
+        discovery.cancel()
+    await asyncio.gather(
+        *([monitor, discovery] if discovery is not None else [monitor]),
+        return_exceptions=True,
+    )
 
 
 def parse_args():
@@ -1959,6 +2019,17 @@ def parse_args():
     parser.add_argument("--port", type=int, default=8080, help="port to listen on (default: %(default)s)")
     parser.add_argument("--auth-token", default="",
                         help="required authentication token (default: $ROBOT_GATEWAY_TOKEN, else none)")
+    parser.add_argument("--robot-id", default=os.environ.get("ROBOT_ID", ""),
+                        help="stable discovery identity (default: $ROBOT_ID or hostname)")
+    parser.add_argument("--robot-name", default=os.environ.get("ROBOT_NAME", ""),
+                        help="discovery display name (default: $ROBOT_NAME or robot id)")
+    parser.add_argument("--discovery", choices=("auto", "on", "off"),
+                        default=os.environ.get("ROBOT_DISCOVERY_MODE", "auto"),
+                        help="UDP discovery mode; auto enables it for non-loopback gateways")
+    parser.add_argument("--discovery-port", type=int, default=DEFAULT_DISCOVERY_PORT,
+                        help="UDP discovery destination port (default: %(default)s)")
+    parser.add_argument("--discovery-interval", type=float, default=DEFAULT_DISCOVERY_INTERVAL_S,
+                        help="seconds between discovery beacons (default: %(default)s)")
     # ros2 launch appends --ros-args; keep them away from argparse.
     args = parser.parse_args(remove_ros_args(sys.argv)[1:])
     if not args.auth_token:
@@ -1966,6 +2037,10 @@ def parse_args():
     if not args.auth_token and not _is_loopback(args.host):
         parser.error("gateway host %r is not loopback but no auth token was provided "
                      "(--auth-token or ROBOT_GATEWAY_TOKEN)" % args.host)
+    if not 1 <= args.discovery_port <= 65535:
+        parser.error("discovery port must be 1-65535")
+    if args.discovery_interval <= 0:
+        parser.error("discovery interval must be greater than zero")
     return args
 
 
@@ -1982,7 +2057,16 @@ def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     rclpy.init(args=sys.argv)
-    node = RobotGatewayNode(host=args.host, port=args.port, auth_token=args.auth_token)
+    node = RobotGatewayNode(
+        host=args.host,
+        port=args.port,
+        auth_token=args.auth_token,
+        robot_id=args.robot_id,
+        robot_name=args.robot_name,
+        discovery_mode=args.discovery,
+        discovery_port=args.discovery_port,
+        discovery_interval=args.discovery_interval,
+    )
 
     try:
         asyncio.run(run_gateway(node))
