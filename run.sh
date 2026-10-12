@@ -642,9 +642,10 @@ info "      Log:         $LOG"
 
 launch_args=(backend:="$BACKEND" mode:="$MODE" maps_dir:="$MAPS_DIR" rviz:="$RVIZ"
              gateway:="$GATEWAY" gateway_host:="$GATEWAY_HOST" gateway_port:="$GATEWAY_PORT"
-             robot_id:="$ROBOT_ID" robot_name:="$ROBOT_NAME"
              gateway_discovery:="$GATEWAY_DISCOVERY" discovery_port:="$DISCOVERY_PORT"
              discovery_interval:="$DISCOVERY_INTERVAL")
+[[ -n "$ROBOT_ID" ]] && launch_args+=(robot_id:="$ROBOT_ID")
+[[ -n "$ROBOT_NAME" ]] && launch_args+=(robot_name:="$ROBOT_NAME")
 if ((HEADLESS)) && [[ "$BACKEND" == "sim" ]]; then launch_args+=(headless:=-s); fi
 
 : >"$LOG"

@@ -49,7 +49,9 @@ amcl:
     # The SLAM map origin coincides with the spawn pose, so start localized there.
     # RViz "2D Pose Estimate" (/initialpose) overrides this at any time.
     set_initial_pose: true
-    always_reset_initial_pose: false
+    # A lifecycle reset invalidates the previous map's pose estimate. Reuse the
+    # configured simulator spawn estimate and refine it from scans on the new map.
+    always_reset_initial_pose: true
     initial_pose:
       x: 0.0
       y: 0.0

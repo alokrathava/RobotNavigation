@@ -3,7 +3,7 @@
 ## Development Process
 
 - Do not proceed to the next phase until the current phase has been demonstrated working with commands.
-- Do not build Gazebo, Nav2, WebSocket, and Android simultaneously.
+- Do not build Android simultaneously.
 
 ## Scope Restrictions
 

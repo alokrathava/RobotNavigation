@@ -127,10 +127,10 @@ class RobotStateManager(Node):
 
     def on_amcl(self, msg):
         c = msg.pose.covariance
-        if min(c[0], c[7], c[35]) < 0.0:
+        if not all(math.isfinite(value) and value >= -1e-12 for value in (c[0], c[7], c[35])):
             self.amcl_stddev = None
             return
-        self.amcl_stddev = (math.sqrt(max(c[0], c[7])), math.sqrt(c[35]))
+        self.amcl_stddev = (math.sqrt(max(0.0, c[0], c[7])), math.sqrt(max(0.0, c[35])))
 
     def on_safety(self, msg):
         self.safety = msg
@@ -143,6 +143,7 @@ class RobotStateManager(Node):
 
     def on_map_state(self, msg):
         self.map_id = msg.active_map_id
+        self.map_state = msg
 
     def on_goal(self, msg):
         self.goal_pose = msg
@@ -239,6 +240,12 @@ class RobotStateManager(Node):
 
     # ---- localization ----
     def localization_state(self, pose_ok):
+        map_state = getattr(self, 'map_state', None)
+        if map_state is not None:
+            if map_state.mode == MapState.MODE_MAPPING:
+                return 'UNINITIALIZED'
+            if not map_state.localization_ready:
+                return 'LOST' if self.had_pose else 'UNINITIALIZED'
         if self.amcl_stddev is None:
             return 'UNINITIALIZED' if not self.had_pose else 'LOST'
         if not pose_ok:

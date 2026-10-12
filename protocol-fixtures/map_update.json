@@ -1,0 +1,1 @@
+{"type":"map_update","protocolVersion":1,"payload":{"streamVersion":1,"baseSequence":4,"sequence":5,"mapId":"main_floor","frameId":"map","stamp":{"sec":11,"nanosec":0},"x":1,"y":0,"width":1,"height":1,"encoding":"occupancy-int8-zlib-base64-v1","cellCount":1,"data":"eJxLAQAAZQBl"}}

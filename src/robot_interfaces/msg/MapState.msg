@@ -17,6 +17,7 @@ string active_map_id
 bool map_available
 bool localization_ready
 bool navigation_runtime_ready
+bool unsaved_changes
+bool recoverable_session
 string error_code
 string detail
-

@@ -1,1 +1,1 @@
-{"type":"robot_discovery_beacon","protocolVersion":1,"robotId":"robot-01","name":"Robot 01","port":8080,"gatewayPort":8080,"gatewayVersion":"0.2.0","tls":false}
+{"type":"robot_discovery_beacon","protocolVersion":1,"robotId":"robot-01","name":"Robot 01","port":8080,"gatewayPort":8080,"gatewayVersion":"0.3.0","tls":false}
