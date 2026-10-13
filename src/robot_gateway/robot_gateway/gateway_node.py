@@ -677,7 +677,8 @@ class RobotGatewayNode(Node):
                                           'Protocol v1 requires JSON text messages')
                     continue
                 if len(message_text.encode("utf-8")) > MAX_MESSAGE_SIZE_BYTES:
-                    await self.send_error(websocket, None, "PAYLOAD_TOO_LARGE", f"Message payload exceeds {MAX_MESSAGE_SIZE_BYTES} bytes")
+                    await self.send_error(websocket, RobotGatewayNode._message_id(message_text),
+                                          "PAYLOAD_TOO_LARGE", f"Message payload exceeds {MAX_MESSAGE_SIZE_BYTES} bytes")
                     continue
                 urgent = False
                 if len(pending) >= 32:
@@ -687,7 +688,7 @@ class RobotGatewayNode(Node):
                     except (ValueError, AttributeError):
                         pass
                 if len(pending) >= 32 and not urgent:
-                    await self.send_error(websocket, None, 'TOO_MANY_REQUESTS',
+                    await self.send_error(websocket, RobotGatewayNode._message_id(message_text), 'TOO_MANY_REQUESTS',
                                           'At most 32 commands may be pending')
                     continue
                 # Keep receiving E-stop/manual takeover while planning or action service
@@ -715,17 +716,30 @@ class RobotGatewayNode(Node):
             self.last_command_times.pop(websocket, None)
             LOGGER.info("Client disconnected: %s (session: %s)", remote, session_id)
 
+    @staticmethod
+    def _message_id(message_text):
+        """Recover correlation independently of payload validation or dispatch."""
+        try:
+            data = json.loads(message_text)
+            return data.get('id') if isinstance(data, dict) else None
+        except (ValueError, TypeError):
+            return None
+
     async def _process_client_message(self, ws, message_text):
+        """Contain dispatch exceptions while retaining the originating command ID."""
         try:
             await self.process_message(ws, message_text)
         except websockets.ConnectionClosed:
-            pass
+            LOGGER.info('Client closed before command response id=%s',
+                        RobotGatewayNode._message_id(message_text))
         except Exception as exc:
-            LOGGER.exception('Unhandled error processing command')
-            await self.send_error(ws, None, 'INTERNAL_ERROR',
+            LOGGER.exception('Unhandled error processing command id=%s',
+                             RobotGatewayNode._message_id(message_text))
+            await self.send_error(ws, RobotGatewayNode._message_id(message_text), 'INTERNAL_ERROR',
                                   f'Gateway failed to process the command: {exc}')
 
     async def process_message(self, ws: ServerConnection, text: str):
+        """Validate and dispatch an envelope without losing correlation on invalid payloads."""
         try:
             data = json.loads(text)
         except Exception:
@@ -733,7 +747,7 @@ class RobotGatewayNode(Node):
             return
 
         if not isinstance(data, dict) or not isinstance(data.get('payload', {}), dict):
-            await self.send_error(ws, None, 'INVALID_ARGUMENT',
+            await self.send_error(ws, data.get('id') if isinstance(data, dict) else None, 'INVALID_ARGUMENT',
                                   'Message and payload must be JSON objects')
             return
 
@@ -1598,45 +1612,75 @@ class RobotGatewayNode(Node):
 
     async def handle_start_mapping(self, ws: ServerConnection, msg_id: str | None,
                                    payload: Dict[str, Any]):
-        if not await RobotGatewayNode._ensure_map_service(self, 'srv_start_mapping', StartMapping):
-            await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", "StartMapping service is unavailable")
-            return
-
+        """Validate explicit recovery choices and await only ROS transition admission."""
         resume = payload.get("resumeUnsaved", False)
         discard = payload.get("discardUnsaved", False)
+        LOGGER.info('[MAPPING] Request received id=%s resumeUnsaved=%s discardUnsaved=%s',
+                    msg_id, resume if isinstance(resume, bool) else '<invalid>',
+                    discard if isinstance(discard, bool) else '<invalid>')
         if not isinstance(resume, bool) or not isinstance(discard, bool) or (resume and discard):
             await self.send_error(ws, msg_id, "INVALID_ARGUMENT",
-                                  "resumeUnsaved and discardUnsaved must be exclusive Booleans")
+                                  "resumeUnsaved and discardUnsaved must be exclusive Booleans",
+                                  subsystem='mapping')
             return
-        request = StartMapping.Request()
-        request.resume_unsaved = resume
-        request.discard_unsaved = discard
-        res = await self._await_future(
-            self.srv_start_mapping.call_async(request), timeout=MAP_ADMISSION_TIMEOUT)
-        if res and res.success:
-            await self.send_ack(ws, msg_id)
-        else:
-            msg = res.message if res else "Start mapping failed"
-            await self.send_error(ws, msg_id, (res.error_code if res else "") or "MAPPING_START_FAILED", msg)
+        await RobotGatewayNode._mapping_service_command(
+            self, ws, msg_id, 'srv_start_mapping', StartMapping,
+            StartMapping.Request(resume_unsaved=resume, discard_unsaved=discard))
+
+    async def _mapping_service_command(self, ws, msg_id, attribute, service_type, request):
+        """Wait only for admission, retaining transport failures and ROS rejection details."""
+        started = time.monotonic()
+        try:
+            available = await RobotGatewayNode._ensure_map_service(self, attribute, service_type)
+            LOGGER.info('[MAPPING] ROS service availability id=%s service=%s ready=%s',
+                        msg_id, attribute, available)
+            if not available:
+                await self.send_error(ws, msg_id, 'SERVICE_UNAVAILABLE',
+                                      f'{service_type.__name__} service is unavailable', subsystem='mapping')
+                return
+            LOGGER.info('[MAPPING] ROS service call started id=%s service=%s', msg_id, attribute)
+            outcome, res, exc = await self._await_future_outcome(
+                getattr(self, attribute).call_async(request), timeout=MAP_ADMISSION_TIMEOUT)
+            if outcome == FUTURE_TIMEOUT:
+                await self.send_error(ws, msg_id, 'SERVICE_TIMEOUT',
+                                      f'{service_type.__name__} admission timed out; check map_state before retrying',
+                                      subsystem='mapping')
+            elif outcome == FUTURE_EXCEPTION:
+                LOGGER.error('[MAPPING] ROS service exception id=%s: %s', msg_id, exc)
+                await self.send_error(ws, msg_id, 'INTERNAL_ERROR', str(exc), subsystem='mapping')
+            elif res is None:
+                await self.send_error(ws, msg_id, 'INTERNAL_ERROR',
+                                      'Mapping service returned no response', subsystem='mapping')
+            else:
+                LOGGER.info('[MAPPING] ROS service response id=%s accepted=%s code=%s message=%s',
+                            msg_id, res.success, res.error_code, res.message)
+                if res.success:
+                    await self.send_ack(ws, msg_id)
+                    LOGGER.info('[MAPPING] WebSocket acknowledgement sent id=%s', msg_id)
+                else:
+                    await self.send_error(ws, msg_id, res.error_code or 'MAPPING_FAILED',
+                                          res.message, subsystem='mapping')
+            LOGGER.info('[MAPPING] WebSocket response sent id=%s', msg_id)
+        except websockets.ConnectionClosed:
+            LOGGER.info('[MAPPING] Client disconnected id=%s; ROS transition remains authoritative', msg_id)
+        except Exception as exc:
+            LOGGER.exception('[MAPPING] Command failed id=%s', msg_id)
+            await self.send_error(ws, msg_id, 'INTERNAL_ERROR', str(exc), subsystem='mapping')
+        finally:
+            LOGGER.info('[MAPPING] Request completed id=%s elapsed=%.3fs',
+                        msg_id, time.monotonic() - started)
 
     async def handle_stop_mapping(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
-        if not await RobotGatewayNode._ensure_map_service(self, 'srv_stop_mapping', StopMapping):
-            await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", "StopMapping service is unavailable")
-            return
-
+        """Require a Boolean discard decision and propagate stop admission outcomes."""
         req = StopMapping.Request()
         discard = payload.get('discardUnsaved', False)
         if not isinstance(discard, bool):
-            await self.send_error(ws, msg_id, 'INVALID_ARGUMENT', 'discardUnsaved must be a Boolean')
+            await self.send_error(ws, msg_id, 'INVALID_ARGUMENT', 'discardUnsaved must be a Boolean',
+                                  subsystem='mapping')
             return
         req.discard_unsaved = discard
-        res = await self._await_future(
-            self.srv_stop_mapping.call_async(req), timeout=MAP_ADMISSION_TIMEOUT)
-        if res and res.success:
-            await self.send_ack(ws, msg_id)
-        else:
-            msg = res.message if res else "Stop mapping failed"
-            await self.send_error(ws, msg_id, (res.error_code if res else "") or "MAPPING_STOP_FAILED", msg)
+        await RobotGatewayNode._mapping_service_command(
+            self, ws, msg_id, 'srv_stop_mapping', StopMapping, req)
 
     async def handle_list_virtual_walls(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
         map_id = payload.get("mapId", "")
@@ -2421,7 +2465,8 @@ class RobotGatewayNode(Node):
         await ws.send(safe_dumps(resp))
 
     async def send_ack(self, ws: ServerConnection, msg_id: str | None):
-        if msg_id:
+        # Keep even an empty or numeric supplied ID rather than dropping its correlation.
+        if msg_id is not None:
             await ws.send(safe_dumps({
                 "type": "command_ack",
                 "id": msg_id,
@@ -2429,6 +2474,7 @@ class RobotGatewayNode(Node):
             }))
 
     async def send_error(self, ws: ServerConnection, msg_id: str | None, code: str, message: str, subsystem: str = "gateway", recoverable: bool = True):
+        """Send the canonical error envelope with its original correlation ID."""
         resp = {
             "type": "command_error",
             "protocolVersion": PROTOCOL_VERSION,
@@ -2440,9 +2486,11 @@ class RobotGatewayNode(Node):
                 "recoverable": recoverable
             }
         }
-        if msg_id:
+        if msg_id is not None:
             resp["id"] = msg_id
         await ws.send(safe_dumps(resp))
+        if subsystem == 'mapping':
+            LOGGER.info('[MAPPING] WebSocket error sent id=%s code=%s', msg_id, code)
 
 
 async def _monitor_loop(node: RobotGatewayNode):

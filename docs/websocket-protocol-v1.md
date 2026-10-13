@@ -16,11 +16,29 @@ must select one. `stop_mapping.payload.discardUnsaved` explicitly permits discar
 unsaved session. `save_map.payload` contains `name` and optional `overwrite`; overwrite
 defaults to `false`.
 
+Missing recovery options both default to false. Strings and numeric Boolean substitutes
+are rejected with `INVALID_ARGUMENT`, as are requests setting both options to true.
+Mapping rejections retain the command ID and use `command_error.error.subsystem: mapping`.
+`RECOVERABLE_SESSION_EXISTS` requires an operator decision to resume or discard;
+`MAPPING_RECOVERY_CORRUPT` preserves an invalid checkpoint for inspection.
+Service discovery failures return `SERVICE_UNAVAILABLE`; admission timeouts return
+`SERVICE_TIMEOUT`, distinct from service exceptions (`INTERNAL_ERROR`). A timeout or
+disconnect does not cancel an admitted map transition or discard recovery files.
+Check the authoritative state before retrying an uncertain admission.
+
 `map_state.payload` contains `state`, `mode`, `activeMapId`, `mapAvailable`,
 `localizationReady`, `navigationRuntimeReady`, `unsavedChanges`, `recoverableSession`,
 `errorCode`, and `detail`. Motion remains inhibited during map changes until the map,
 AMCL covariance, required TF chain, and navigation runtime are ready. A failed switch
 restores the previous map when possible.
+
+Existing state names remain unchanged. `NO_MAP` represents idle without a map; `ACTIVE`
+represents a loaded map. `SWITCHING` covers starting and stopping, with the phase in
+`detail`. `MAPPING` is published only after SLAM and occupancy-grid readiness; `SAVING`
+reports a save in progress and `ERROR` reports failure via `errorCode` and `detail`.
+`command_ack` reports acceptance, while a terminal `map_state` reports completion.
+Authenticated reconnects receive the latest map state, also available in
+`request_state_snapshot` → `robot_state_snapshot.payload.mapState`.
 
 ## Occupancy-grid stream
 

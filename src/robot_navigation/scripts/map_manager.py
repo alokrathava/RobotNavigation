@@ -402,19 +402,25 @@ class MapManager(Node):
         os.replace(tmp, os.path.join(self.maps_dir, '.active_map'))
 
     def detect_recoverable_session(self):
+        """Detect complete legacy or generation checkpoints; SLAM validates their contents on resume."""
         marker = os.path.join(self.session_dir, 'session.yaml')
         try:
             with open(marker, encoding='utf-8') as stream:
                 metadata = yaml.safe_load(stream)
+            if metadata.get('format_version') != FORMAT_VERSION:
+                return False
             checkpoint = metadata.get('checkpoint', 'session')
             if not re.fullmatch(r'(session|checkpoint_[a-f0-9]{32})', checkpoint):
                 return False
             self.session_prefix = os.path.join(self.session_dir, checkpoint)
         except (OSError, TypeError, AttributeError, yaml.YAMLError):
             return False
-        return (os.path.isfile(os.path.join(self.session_dir, 'session.yaml'))
-                and os.path.isfile(self.session_prefix + '.posegraph')
-                and os.path.isfile(self.session_prefix + '.data'))
+        try:
+            return all(os.path.isfile(self.session_prefix + suffix)
+                       and os.path.getsize(self.session_prefix + suffix) > 0
+                       for suffix in ('.posegraph', '.data'))
+        except OSError:
+            return False
 
     def clear_mapping_session(self):
         try:
@@ -484,8 +490,19 @@ class MapManager(Node):
         return msg
 
     def publish_state(self):
+        """Publish authoritative state and log changes without logging every identical grid update."""
         with self.lock:
             self.state_pub.publish(self.state_msg())
+            signature = (self.state, self.mode, self.active_map_id, self.recoverable_session,
+                         self.mapping_unsaved, self.localization_ready, self.navigation_ready,
+                         self.error_code, self.detail)
+            if signature != getattr(self, '_logged_map_state', None):
+                self._logged_map_state = signature
+                self.get_logger().info(
+                    f'[MAPPING] Map state published state={self.state} mode={self.mode} '
+                    f'active_map_id={self.active_map_id} recoverable={self.recoverable_session} '
+                    f'unsaved={self.mapping_unsaved} localization_ready={self.localization_ready} '
+                    f'navigation_ready={self.navigation_ready} code={self.error_code} detail={self.detail}')
 
     def set_state(self, state, mode=None, detail='', error_code=''):
         with self.lock:
@@ -981,6 +998,8 @@ class MapManager(Node):
             raise MapFailure('LOCALIZATION_UNAVAILABLE', 'AMCL rejected the map-specific initial pose')
 
     def start_mapping(self, resume_unsaved=False):
+        """Initialize SLAM in the worker and commit MAPPING only after grid and safety readiness."""
+        self.get_logger().info(f'[MAPPING] SLAM initialization started resume_unsaved={resume_unsaved}')
         self.navigation_hold(True)
         self.manage_localization(ManageLifecycleNodes.Request.PAUSE)
         if self.lifecycle_state(self.amcl_state, 'MAPPING_FAILED') == 'active':
@@ -992,11 +1011,11 @@ class MapManager(Node):
         if self.lifecycle_state(self.map_server_state, 'MAPPING_FAILED') == 'inactive':
             self.change(self.map_server_change, Transition.TRANSITION_CLEANUP, 'MAPPING_FAILED')
         with self.lock:
-            self.mode = MapState.MODE_MAPPING
             self.map_ready.clear()
             self.mapping_signature = None
             self.mapping_grid = None
             self.saved_mapping_signature = None
+            self.set_state(MapState.SWITCHING, MapState.MODE_MAPPING, 'initializing SLAM mapping')
         self.slam_start()
         if resume_unsaved:
             request = DeserializePoseGraph.Request(
@@ -1021,6 +1040,7 @@ class MapManager(Node):
         self.wait_ready(self.motion_ready, self.map_wait_timeout, 'MAPPING_FAILED',
                         'manual velocity safety pipeline did not become ready')
         self.set_state(MapState.MAPPING, MapState.MODE_MAPPING, 'SLAM mapping active')
+        self.get_logger().info('[MAPPING] SLAM initialization completed')
 
     def stop_mapping(self):
         self.navigation_hold(True)
@@ -1240,26 +1260,40 @@ class MapManager(Node):
         return response
 
     def srv_start_mapping(self, request, response):
+        """Admit explicit recovery decisions promptly and preserve checkpoints on rejection."""
+        if request.resume_unsaved and request.discard_unsaved:
+            # Invalid input must not become a busy-transition error or acquire ownership.
+            response.success, response.error_code = False, 'INVALID_ARGUMENT'
+            response.message = 'resume_unsaved and discard_unsaved are mutually exclusive'
+            response.state = self.state_msg()
+            self.get_logger().info('[MAPPING] Transition rejected code=INVALID_ARGUMENT')
+            return response
+
         def prepare():
+            # Validate before starting the worker or deleting any recoverable data.
             if self.mode == MapState.MODE_MAPPING:
                 raise MapFailure('MAPPING_ACTIVE', 'mapping is already active')
-            if request.resume_unsaved and request.discard_unsaved:
-                raise MapFailure('INVALID_REQUEST',
-                                 'resume_unsaved and discard_unsaved are mutually exclusive')
-            if request.resume_unsaved and not self.recoverable_session:
-                raise MapFailure('NO_RECOVERABLE_SESSION', 'no recoverable mapping session exists')
+            self.recoverable_session = self.detect_recoverable_session()
             if (os.path.exists(self.session_dir) and not self.recoverable_session
                     and not request.discard_unsaved):
                 raise MapFailure('MAPPING_RECOVERY_CORRUPT',
                                  'mapping checkpoint is invalid; explicitly discard it to start fresh')
+            if request.resume_unsaved and not self.recoverable_session:
+                raise MapFailure('NO_RECOVERABLE_SESSION', 'no recoverable mapping session exists')
             if self.recoverable_session and not (request.resume_unsaved or request.discard_unsaved):
                 raise MapFailure('RECOVERABLE_SESSION_EXISTS',
-                                 'resume or discard the recoverable mapping session')
-            if request.discard_unsaved:
-                self.clear_mapping_session()
+                                 'Resume or discard the recoverable mapping session')
             self.previous_map_id = self.active_map_id
 
+        def operation():
+            # An explicit discard may involve slow filesystem work; keep it off the service callback.
+            if request.discard_unsaved:
+                self.clear_mapping_session()
+            self.start_mapping(request.resume_unsaved)
+
         def failed(exc):
+            # Preserve the checkpoint and expose startup failure through authoritative state.
+            self.get_logger().error(f'[MAPPING] SLAM initialization failed code={exc.code} detail={exc.detail}')
             # Startup failures must leave SLAM inactive before attempting localization.
             try:
                 self.slam_stop()
@@ -1267,10 +1301,14 @@ class MapManager(Node):
                 self.get_logger().error(f'cannot stop failed SLAM session: {cleanup.detail}')
             self.set_state(MapState.ERROR, error_code=exc.code, detail=exc.detail)
 
-        return self.admit_transition(
+        result = self.admit_transition(
             response, prepare, MapState.SWITCHING, None, 'leaving localization mode',
-            lambda: self.start_mapping(request.resume_unsaved), failed,
+            operation, failed,
             'start mapping accepted')
+        self.get_logger().info(
+            f'[MAPPING] Transition accepted={result.success} code={result.error_code} '
+            f'resume_unsaved={request.resume_unsaved} discard_unsaved={request.discard_unsaved}')
+        return result
 
     def srv_stop_mapping(self, request, response):
         def prepare():
