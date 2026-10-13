@@ -1,1 +1,1 @@
-{"type":"map_state","protocolVersion":1,"payload":{"state":"ACTIVE","mode":"LOCALIZATION","activeMapId":"main_floor","mapAvailable":true,"localizationReady":true,"navigationRuntimeReady":true,"errorCode":"","detail":"map active"}}
+{"type":"map_state","protocolVersion":1,"payload":{"state":"ACTIVE","mode":"LOCALIZATION","activeMapId":"main_floor","mapAvailable":true,"localizationReady":true,"navigationRuntimeReady":true,"unsavedChanges":false,"recoverableSession":false,"errorCode":"","detail":"map active"}}

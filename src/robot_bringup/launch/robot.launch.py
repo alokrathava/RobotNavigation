@@ -57,7 +57,12 @@ def generate_launch_description():
     gateway = Node(
         package='robot_gateway', executable='gateway_node', name='robot_gateway',
         output='screen',
-        parameters=[{'maps_dir': LaunchConfiguration('maps_dir')}],
+        parameters=[{
+            'maps_dir': LaunchConfiguration('maps_dir'),
+            'manual_max_linear_mps': 0.45,
+            'manual_max_angular_rad_s': 1.0,
+            'manual_max_reverse_mps': 0.2,
+        }],
         # The token is read from $ROBOT_GATEWAY_TOKEN when set, keeping it off the command line.
         arguments=['--host', LaunchConfiguration('gateway_host'),
                    '--port', LaunchConfiguration('gateway_port'),

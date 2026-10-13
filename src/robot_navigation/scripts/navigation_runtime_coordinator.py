@@ -255,6 +255,9 @@ class NavigationRuntimeCoordinator(Node):
         if not self.enabled:
             if self.frontend_active():
                 self.request_manage('frontend', ManageLifecycleNodes.Request.PAUSE)
+            if (self.map_state is not None and self.map_state.mode == MapState.MODE_MAPPING
+                    and not self.nodes_active(CORE_NODES)):
+                self.request_manage('core', ManageLifecycleNodes.Request.STARTUP)
             return
         if not self.nodes_active(LOCALIZATION_NODES):
             self.log_frontend_wait()

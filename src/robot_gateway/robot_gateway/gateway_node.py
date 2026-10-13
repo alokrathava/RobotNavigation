@@ -25,9 +25,12 @@ from typing import Any, Dict, List, Optional, Set
 import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
-from geometry_msgs.msg import PoseStamped, TwistStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TwistStamped
 from lifecycle_msgs.srv import GetState
-from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
+from map_msgs.msg import OccupancyGridUpdate
+from nav2_msgs.action import (ComputePathThroughPoses, ComputePathToPose,
+                              NavigateThroughPoses, NavigateToPose)
+from nav_msgs.msg import OccupancyGrid, Path
 from rcl_interfaces.msg import Log, Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.action import ActionClient
@@ -38,7 +41,7 @@ from rclpy.utilities import remove_ros_args
 from robot_interfaces.msg import DockingState, MapPoint as RosMapPoint, MapState, RobotBatteryState, RobotHealth, RobotTelemetry, SafetyState, VirtualWall as RosVirtualWall
 from robot_interfaces.srv import ActivateMap, CheckMapPoint, ClearVirtualWalls, CreateVirtualWall, DeleteMap, DeleteVirtualWall, ListMaps, ListVirtualWalls, RenameMap, SaveMap, SetVirtualWallEnabled, StartMapping, StopMapping, UpdateVirtualWall
 from std_msgs.msg import Bool
-from std_srvs.srv import Trigger
+from std_srvs.srv import Empty, Trigger
 from unique_identifier_msgs.msg import UUID as UuidMsg
 import websockets
 from websockets.asyncio.server import ServerConnection, serve
@@ -48,6 +51,7 @@ from robot_gateway.protocol_contract import (
     GATEWAY_VERSION,
     PROTOCOL_VERSION,
 )
+from robot_gateway.map_stream import MapStreamError, MapStreamState
 
 LOGGER = logging.getLogger("robot_gateway")
 RECENT_LOG_CAPACITY = 500
@@ -56,6 +60,8 @@ LOG_LEVEL_NAMES = {10: "DEBUG", 20: "INFO", 30: "WARN", 40: "ERROR", 50: "ERROR"
 MAP_ADMISSION_TIMEOUT = 10.0
 MAX_MESSAGE_SIZE_BYTES = 5_000_000  # 5 MB payload limit
 NAV_GOAL_RESPONSE_TIMEOUT_S = 10.0
+DEFAULT_NAV_TIMEOUT_S = 300.0
+MAX_NAV_TIMEOUT_S = 3600.0
 NAV_CANCEL_WAIT_S = 5.0  # bounded wait for a cancelled navigator to reach a terminal state
 LOOP_LAG_PERIOD_S = 0.1
 DEFAULT_DISCOVERY_PORT = 8088
@@ -141,7 +147,7 @@ def is_valid_map_id(map_id: str) -> bool:
         return False
     if ".." in map_id or "/" in map_id or "\\" in map_id or "\0" in map_id:
         return False
-    return bool(re.match(r"^[a-zA-Z0-9_\-]+$", map_id))
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", map_id))
 
 
 MAP_STATE_NAMES = {
@@ -218,6 +224,10 @@ class RobotGatewayNode(Node):
         self.discovery_enabled = discovery_is_enabled(host, discovery_mode)
         self.maps_dir = os.path.realpath(os.path.expanduser(
             self.declare_parameter("maps_dir", "~/.robot/maps").value))
+        self.default_navigation_timeout = float(
+            self.declare_parameter('navigation_timeout_seconds', DEFAULT_NAV_TIMEOUT_S).value)
+        if not 1.0 <= self.default_navigation_timeout <= MAX_NAV_TIMEOUT_S:
+            raise ValueError('navigation_timeout_seconds must be between 1 and 3600')
 
         self.ws_clients: Set[ServerConnection] = set()
         self.authenticated_clients: Set[ServerConnection] = set()
@@ -225,6 +235,14 @@ class RobotGatewayNode(Node):
         self.control_owner: Optional[ServerConnection] = None
         self.last_command_times: Dict[ServerConnection, Dict[str, float]] = {}
         self.motion_limits_lock = asyncio.Lock()
+        self.navigation_lock = asyncio.Lock()
+        self.motion_epoch = 0
+        self.service_recovery_locks = {}
+        self.map_subscribers: Set[ServerConnection] = set()
+        self.path_subscribers: Set[ServerConnection] = set()
+        self.map_stream = MapStreamState()
+        self.pending_map_event = None
+        self.pending_path_events: Dict[str, Dict[str, Any]] = {}
 
         latched_qos = QoSProfile(
             depth=1,
@@ -234,6 +252,8 @@ class RobotGatewayNode(Node):
 
         # Publishers
         self.cmd_vel_pub = self.create_publisher(TwistStamped, "cmd_vel_manual", 10)
+        self.initial_pose_pub = self.create_publisher(
+            PoseWithCovarianceStamped, "/initialpose", latched_qos)
 
         # Service Clients
         self.srv_manual_stop = self.create_client(Trigger, "/robot/manual/stop")
@@ -261,10 +281,15 @@ class RobotGatewayNode(Node):
         self.srv_disable_wall = self.create_client(SetVirtualWallEnabled, "/robot/virtual_walls/disable")
         self.srv_check_point = self.create_client(CheckMapPoint, "/robot/virtual_walls/check_point")
         self.srv_clear_walls = self.create_client(ClearVirtualWalls, "/robot/virtual_walls/clear")
+        self.srv_global_localization = self.create_client(
+            Empty, "/reinitialize_global_localization")
 
         # Action Client
         self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self.nav_through_client = ActionClient(self, NavigateThroughPoses, "navigate_through_poses")
+        self.path_to_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
+        self.path_through_client = ActionClient(
+            self, ComputePathThroughPoses, "compute_path_through_poses")
         self.cancel_nav_clients = [
             self.create_client(CancelGoal, "navigate_to_pose/_action/cancel_goal"),
             self.create_client(CancelGoal, "navigate_through_poses/_action/cancel_goal"),
@@ -272,7 +297,10 @@ class RobotGatewayNode(Node):
         self.srv_bt_state = self.create_client(GetState, "/bt_navigator/get_state")
         self.active_navigation_type = NAV_NONE
         self.active_goal_handle = None
+        self.active_result_future = None
         self.active_goal_uuid = b""
+        self.goal_timeout_tasks: Dict[bytes, asyncio.Task] = {}
+        self.timed_out_results: Set[bytes] = set()
         # Goals reported ACCEPTED/EXECUTING/CANCELING on each action's status topic, by uuid.
         # Includes goals sent from RViz or the CLI, not just through this gateway.
         self.status_active: Dict[str, Dict[bytes, int]] = {a: {} for a in set(NAV_ACTION_NAMES.values())}
@@ -295,6 +323,11 @@ class RobotGatewayNode(Node):
         self.create_subscription(DockingState, "/robot/docking/state", self.on_docking, latched_qos)
         self.create_subscription(RobotHealth, "/robot/health", self.on_health, latched_qos)
         self.create_subscription(MapState, "/robot/map/state", self.on_map_state, latched_qos)
+        self.create_subscription(OccupancyGrid, "/map", self.on_map, latched_qos)
+        self.create_subscription(OccupancyGridUpdate, "/map_updates", self.on_map_update, 10)
+        self.create_subscription(Path, "/plan", lambda msg: self.on_path("planned", msg), 10)
+        self.create_subscription(
+            Path, "/travelled_path", lambda msg: self.on_path("travelled", msg), latched_qos)
         self.create_subscription(Log, "/rosout", self.on_rosout, 100)
         self.create_subscription(Bool, "/robot/navigation/runtime_ready", self.on_runtime_ready, latched_qos)
         for action in self.status_active:
@@ -303,14 +336,31 @@ class RobotGatewayNode(Node):
                 lambda msg, a=action: self.on_nav_status(a, msg), qos_profile_action_status_default)
 
         self.last_telemetry = None
+        self.last_telemetry_at = 0.0
         self.last_battery = None
         self.last_safety = None
         self.last_docking = None
         self.last_health = None
         self.last_map_state = None
         self.recent_logs: deque = deque(maxlen=RECENT_LOG_CAPACITY)
-        self.design_limits: Optional[Dict[str, float]] = None  # speed ceiling, read once from the nav params
-        self.current_limits: Optional[Dict[str, float]] = None
+        # Manual driving must remain available while the Nav2 lifecycle is intentionally
+        # down for SLAM. These ceilings are launch-configured from the same robot limits;
+        # live Nav2 parameters can still lower them after navigation starts.
+        manual_linear = float(self.declare_parameter("manual_max_linear_mps", 0.45).value)
+        manual_angular = float(self.declare_parameter("manual_max_angular_rad_s", 1.0).value)
+        manual_reverse = float(self.declare_parameter("manual_max_reverse_mps", 0.2).value)
+        if not all(math.isfinite(value) and value > 0.0
+                   for value in (manual_linear, manual_angular, manual_reverse)):
+            raise ValueError("manual velocity ceilings must be positive")
+        self.design_limits: Optional[Dict[str, float]] = {
+            "linear": manual_linear, "angular": manual_angular,
+            "reverse": manual_reverse, "controller_reverse": manual_reverse,
+        }
+        self.current_limits: Optional[Dict[str, float]] = {
+            "linear": manual_linear, "angular": manual_angular,
+        }
+        self.create_timer(0.5, self.flush_map_event)
+        self.create_timer(0.5, self.flush_path_events)
 
     # ---- ROS Subscriptions Callbacks ----
     def on_telemetry(self, msg: RobotTelemetry):
@@ -349,6 +399,7 @@ class RobotGatewayNode(Node):
             "activeMap": msg.active_map,
         }
         self.last_telemetry = payload
+        self.last_telemetry_at = time.monotonic()
         self.broadcast_event("telemetry", payload)
 
     def on_battery(self, msg: RobotBatteryState):
@@ -434,13 +485,80 @@ class RobotGatewayNode(Node):
             "mapAvailable": msg.map_available,
             "localizationReady": msg.localization_ready,
             "navigationRuntimeReady": msg.navigation_runtime_ready,
+            "unsavedChanges": getattr(msg, "unsaved_changes", False),
+            "recoverableSession": getattr(msg, "recoverable_session", False),
             "errorCode": msg.error_code,
             "detail": msg.detail,
         }
+        if self.map_stream.available and msg.state in (MapState.ACTIVE, MapState.MAPPING):
+            context = (msg.active_map_id, payload['mode'])
+            if context != (self.map_stream.map_id, self.map_stream.mode):
+                # A static map may publish only once, before activation commits its ID.
+                # Relabel that confirmed grid and resynchronize subscribers at commit.
+                self.map_stream.map_id, self.map_stream.mode = context
+                self.map_stream.sequence += 1
+                self.pending_map_event = ('map_snapshot', self.map_stream.snapshot())
         if payload == self.last_map_state:
             return
         self.last_map_state = payload
         self.broadcast_event("map_state", payload)
+
+    def on_map(self, msg: OccupancyGrid):
+        try:
+            map_id = self.last_map_state.get("activeMapId", "") if self.last_map_state else ""
+            mode = self.last_map_state.get("mode", "NONE") if self.last_map_state else "NONE"
+            event = self.map_stream.ingest_full(msg, map_id, mode)
+            if event is not None:
+                self.pending_map_event = (("map_snapshot", self.map_stream.snapshot())
+                                          if self.pending_map_event else event)
+        except MapStreamError as exc:
+            LOGGER.warning("Rejected /map payload: %s", exc)
+
+    def on_map_update(self, msg: OccupancyGridUpdate):
+        try:
+            event = self.map_stream.ingest_update(msg)
+            if event is not None:
+                self.pending_map_event = (("map_snapshot", self.map_stream.snapshot())
+                                          if self.pending_map_event else event)
+        except MapStreamError as exc:
+            LOGGER.warning("Rejected /map_updates payload: %s", exc)
+
+    def flush_map_event(self):
+        if self.pending_map_event is None or not self.map_subscribers:
+            return
+        event_type, payload = self.pending_map_event
+        self.pending_map_event = None
+        message = safe_dumps({"type": event_type, "protocolVersion": PROTOCOL_VERSION,
+                              "payload": payload})
+        asyncio.create_task(self._async_broadcast_to(message, self.map_subscribers))
+
+    def on_path(self, kind: str, msg: Path):
+        poses = msg.poses[-500:]
+        self.pending_path_events[kind] = {
+            "kind": kind,
+            "frameId": msg.header.frame_id,
+            "stamp": ros_time_to_dict(msg.header.stamp),
+            "truncated": len(msg.poses) > len(poses),
+            "poses": [{
+                "stamp": ros_time_to_dict(item.header.stamp),
+                "xMeters": item.pose.position.x,
+                "yMeters": item.pose.position.y,
+                "orientation": {
+                    "x": item.pose.orientation.x, "y": item.pose.orientation.y,
+                    "z": item.pose.orientation.z, "w": item.pose.orientation.w,
+                },
+            } for item in poses],
+        }
+
+    def flush_path_events(self):
+        if not self.pending_path_events or not self.path_subscribers:
+            return
+        events = list(self.pending_path_events.values())
+        self.pending_path_events.clear()
+        for payload in events:
+            message = safe_dumps({"type": "navigation_path", "protocolVersion": PROTOCOL_VERSION,
+                                  "payload": payload})
+            asyncio.create_task(self._async_broadcast_to(message, self.path_subscribers))
 
     def on_runtime_ready(self, msg: Bool):
         self.runtime_ready = bool(msg.data)
@@ -458,6 +576,12 @@ class RobotGatewayNode(Node):
                     "LATE_ACCEPT request=%s goal_uuid=%s action=%s status=%s: Nav2 accepted a goal whose "
                     "response the gateway had already given up on",
                     self.timed_out_goals[uuid_bytes], uuid_bytes.hex(), action, GOAL_STATUS_NAMES.get(entry.status))
+                client = self.cancel_nav_clients[0 if action == 'navigate_to_pose' else 1]
+                if client.service_is_ready():
+                    client.call_async(CancelGoal.Request(goal_info=entry.goal_info))
+                asyncio.create_task(self._fail_safe_stop())
+            elif uuid_bytes in self.timed_out_goals:
+                self.timed_out_goals.pop(uuid_bytes, None)
             if uuid_bytes not in self.goal_status_seen and any(
                     p["uuid"] == uuid_bytes for p in self.pending_nav.values()):
                 self.goal_status_seen[uuid_bytes] = now
@@ -507,6 +631,15 @@ class RobotGatewayNode(Node):
             except Exception:
                 pass
 
+    async def _async_broadcast_to(self, msg: str, clients):
+        for ws in list(clients):
+            if ws not in self.authenticated_clients:
+                continue
+            try:
+                await ws.send(msg)
+            except Exception:
+                pass
+
     # ---- Control Session Ownership ----
     def check_control_ownership(self, ws: ServerConnection) -> bool:
         if self.control_owner is None:
@@ -535,22 +668,40 @@ class RobotGatewayNode(Node):
         self.session_ids[websocket] = session_id
         LOGGER.info("Client connected: %s (session: %s)", remote, session_id)
         self.ws_clients.add(websocket)
+        pending = set()
 
         try:
             async for message_text in websocket:
-                if len(message_text.encode("utf-8")) > MAX_MESSAGE_SIZE_BYTES:
-                    await self.send_error(websocket, None, "PAYLOAD_TOO_LARGE", f"Message payload exceeds {MAX_MESSAGE_SIZE_BYTES} bytes")
+                if not isinstance(message_text, str):
+                    await self.send_error(websocket, None, 'INVALID_JSON',
+                                          'Protocol v1 requires JSON text messages')
                     continue
-                try:
-                    await self.process_message(websocket, message_text)
-                except websockets.ConnectionClosed:
-                    raise
-                except Exception as exc:
-                    LOGGER.exception("Unhandled error processing message (session: %s)", session_id)
-                    await self.send_error(websocket, None, "INTERNAL_ERROR", f"Gateway failed to process the command: {exc}")
+                if len(message_text.encode("utf-8")) > MAX_MESSAGE_SIZE_BYTES:
+                    await self.send_error(websocket, RobotGatewayNode._message_id(message_text),
+                                          "PAYLOAD_TOO_LARGE", f"Message payload exceeds {MAX_MESSAGE_SIZE_BYTES} bytes")
+                    continue
+                urgent = False
+                if len(pending) >= 32:
+                    try:
+                        urgent = json.loads(message_text).get('type') in (
+                            'emergency_stop', 'stop', 'cancel_navigation')
+                    except (ValueError, AttributeError):
+                        pass
+                if len(pending) >= 32 and not urgent:
+                    await self.send_error(websocket, RobotGatewayNode._message_id(message_text), 'TOO_MANY_REQUESTS',
+                                          'At most 32 commands may be pending')
+                    continue
+                # Keep receiving E-stop/manual takeover while planning or action service
+                # responses are pending. ROS mutations remain serialized by their owners.
+                task = asyncio.create_task(self._process_client_message(websocket, message_text))
+                pending.add(task)
+                task.add_done_callback(pending.discard)
         except Exception as exc:
             LOGGER.info("Client connection closed: %s (session: %s, reason: %s)", remote, session_id, exc)
         finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
             if self._mission_running() and self.mission_owner is websocket:
                 LOGGER.warning("Mission %s owner disconnected; cancelling in %.0fs unless control is retaken",
                                self.mission_id, MISSION_DISCONNECT_GRACE_S)
@@ -559,15 +710,45 @@ class RobotGatewayNode(Node):
             self.release_control_ownership(websocket)
             self.ws_clients.discard(websocket)
             self.authenticated_clients.discard(websocket)
+            self.map_subscribers.discard(websocket)
+            self.path_subscribers.discard(websocket)
             self.session_ids.pop(websocket, None)
             self.last_command_times.pop(websocket, None)
             LOGGER.info("Client disconnected: %s (session: %s)", remote, session_id)
 
+    @staticmethod
+    def _message_id(message_text):
+        """Recover correlation independently of payload validation or dispatch."""
+        try:
+            data = json.loads(message_text)
+            return data.get('id') if isinstance(data, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+    async def _process_client_message(self, ws, message_text):
+        """Contain dispatch exceptions while retaining the originating command ID."""
+        try:
+            await self.process_message(ws, message_text)
+        except websockets.ConnectionClosed:
+            LOGGER.info('Client closed before command response id=%s',
+                        RobotGatewayNode._message_id(message_text))
+        except Exception as exc:
+            LOGGER.exception('Unhandled error processing command id=%s',
+                             RobotGatewayNode._message_id(message_text))
+            await self.send_error(ws, RobotGatewayNode._message_id(message_text), 'INTERNAL_ERROR',
+                                  f'Gateway failed to process the command: {exc}')
+
     async def process_message(self, ws: ServerConnection, text: str):
+        """Validate and dispatch an envelope without losing correlation on invalid payloads."""
         try:
             data = json.loads(text)
         except Exception:
             await self.send_error(ws, None, "INVALID_JSON", "Message is not valid JSON")
+            return
+
+        if not isinstance(data, dict) or not isinstance(data.get('payload', {}), dict):
+            await self.send_error(ws, data.get('id') if isinstance(data, dict) else None, 'INVALID_ARGUMENT',
+                                  'Message and payload must be JSON objects')
             return
 
         msg_type = data.get("type")
@@ -585,6 +766,8 @@ class RobotGatewayNode(Node):
         # Rate limiting per category
         category = "velocity" if msg_type == "manual_velocity" else ("auth" if msg_type == "hello" else "command")
         min_interval = 0.02 if category == "velocity" else (0.05 if category == "command" else 0.5)
+        if msg_type in ('emergency_stop', 'stop', 'cancel_navigation'):
+            category, min_interval = 'safety', 0.0
         now_ts = time.time()
         client_times = self.last_command_times.setdefault(ws, {})
         last_ts = client_times.get(category, 0.0)
@@ -621,6 +804,7 @@ class RobotGatewayNode(Node):
             "manual_velocity", "navigate_to", "navigate_through", "cancel_navigation", "stop",
             "dock", "undock", "cancel_docking", "switch_map", "start_mapping", "stop_mapping",
             "save_map", "rename_map", "delete_map",
+            "set_initial_pose", "reinitialize_localization",
             "create_virtual_wall", "update_virtual_wall", "delete_virtual_wall",
             "set_virtual_wall_enabled", "clear_virtual_walls",
             "save_location", "rename_location", "delete_location", "navigate_to_location",
@@ -636,6 +820,10 @@ class RobotGatewayNode(Node):
                     recoverable=True
                 )
                 return
+
+        if msg_type in {'manual_velocity', 'stop', 'emergency_stop', 'cancel_navigation',
+                        'switch_map', 'start_mapping', 'stop_mapping'}:
+            self.motion_epoch = getattr(self, 'motion_epoch', 0) + 1
 
         # ---- Commands ----
         if msg_type == "manual_velocity":
@@ -663,7 +851,7 @@ class RobotGatewayNode(Node):
         elif msg_type == "switch_map":
             await self.handle_switch_map(ws, msg_id, data.get("payload", {}))
         elif msg_type == "start_mapping":
-            await self.handle_start_mapping(ws, msg_id)
+            await self.handle_start_mapping(ws, msg_id, data.get("payload", {}))
         elif msg_type == "stop_mapping":
             await self.handle_stop_mapping(ws, msg_id, data.get("payload", {}))
         elif msg_type == "save_map":
@@ -706,6 +894,23 @@ class RobotGatewayNode(Node):
             await self.handle_request_state_snapshot(ws, msg_id)
         elif msg_type == "get_recent_logs":
             await self.handle_get_recent_logs(ws, msg_id, data.get("payload", {}))
+        elif msg_type == "subscribe_map":
+            await self.handle_subscribe_map(ws, msg_id)
+        elif msg_type == "request_map_snapshot":
+            await self.handle_map_snapshot(ws, msg_id)
+        elif msg_type == "unsubscribe_map":
+            self.map_subscribers.discard(ws)
+            await self.send_ack(ws, msg_id)
+        elif msg_type == "subscribe_navigation_path":
+            self.path_subscribers.add(ws)
+            await self.send_ack(ws, msg_id)
+        elif msg_type == "unsubscribe_navigation_path":
+            self.path_subscribers.discard(ws)
+            await self.send_ack(ws, msg_id)
+        elif msg_type == "set_initial_pose":
+            await self.handle_set_initial_pose(ws, msg_id, data.get("payload", {}))
+        elif msg_type == "reinitialize_localization":
+            await self.handle_reinitialize_localization(ws, msg_id)
         else:
             await self.send_error(ws, msg_id, "UNKNOWN_COMMAND", f"Command type '{msg_type}' is unknown")
 
@@ -826,6 +1031,26 @@ class RobotGatewayNode(Node):
         except Exception:
             return None
 
+    async def _ensure_map_service(self, attribute, service_type):
+        client = getattr(self, attribute)
+        if client.service_is_ready():
+            return True
+        # Discovery can lose the request/reply match across lifecycle transitions.
+        # Rebuild only the unmatched client and keep the WebSocket loop responsive.
+        lock = self.service_recovery_locks.setdefault(attribute, asyncio.Lock())
+        async with lock:
+            client = getattr(self, attribute)
+            if client.service_is_ready():
+                return True
+            name = client.srv_name
+            self.destroy_client(client)
+            client = self.create_client(service_type, name)
+            setattr(self, attribute, client)
+            deadline = time.monotonic() + 5.0
+            while not client.service_is_ready() and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            return client.service_is_ready()
+
     async def _await_future_outcome(self, future, timeout: float):
         """Like _await_future, but keeps timeout, exception and result distinct.
 
@@ -868,6 +1093,72 @@ class RobotGatewayNode(Node):
         pose.pose.orientation.w = math.cos(yaw / 2.0)
         return pose
 
+    @staticmethod
+    def _validate_point(point: Dict[str, Any]):
+        if not isinstance(point, dict):
+            return "destination must be an object"
+        values = (point.get("xMeters"), point.get("yMeters"), point.get("yawRadians", 0.0))
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+            return "xMeters, yMeters, and yawRadians must be numbers"
+        if not all(math.isfinite(float(value)) for value in values):
+            return "destination coordinates and orientation must be finite"
+        return None
+
+    def _autonomy_error(self):
+        if not self.last_map_state or self.last_map_state.get("state") != "ACTIVE":
+            return "MAP_NOT_ACTIVE", "Autonomous navigation requires an active map"
+        if not self.last_map_state.get("localizationReady"):
+            return "LOCALIZATION_NOT_READY", "AMCL localization is not ready"
+        if self.runtime_ready is not True:
+            return "NAVIGATION_RUNTIME_NOT_READY", "Nav2 runtime is not ready"
+        if not self.last_telemetry or time.monotonic() - self.last_telemetry_at > 1.0:
+            return "TELEMETRY_STALE", "Robot pose telemetry is unavailable or stale"
+        if (not self.last_telemetry.get("poseValid")
+                or self.last_telemetry.get("localizationState") != "LOCALIZED"):
+            return "LOCALIZATION_NOT_READY", "Robot pose is not localized"
+        safety = self.last_safety or {}
+        if (not self.last_safety or safety.get("emergencyStopActive")
+                or safety.get("motionInhibited") or safety.get('state') == SafetyState.FAULT):
+            return "MOTION_INHIBITED", "Safety supervision currently inhibits motion"
+        return None
+
+    async def _preflight_path(self, nav_type, goal_msg):
+        if nav_type in (NAV_TO, NAV_MISSION):
+            client = self.path_to_client
+            request = ComputePathToPose.Goal()
+            request.goal = goal_msg.pose
+            request.use_start = False
+        else:
+            client = self.path_through_client
+            request = ComputePathThroughPoses.Goal()
+            request.goals = goal_msg.poses
+            request.use_start = False
+        poses = [goal_msg.pose] if nav_type in (NAV_TO, NAV_MISSION) else goal_msg.poses.goals
+        for stamped in poses:
+            pose = stamped.pose
+            values = (pose.position.x, pose.position.y, pose.position.z,
+                      pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w)
+            norm = sum(value * value for value in values[3:])
+            if not all(math.isfinite(value) for value in values) or abs(norm - 1.0) > 0.01:
+                return 'INVALID_DESTINATION', 'Destination needs finite coordinates and a unit quaternion'
+        if not client.server_is_ready():
+            return "PLANNER_UNAVAILABLE", "Nav2 path planner is unavailable"
+        state, handle, exc = await self._await_future_outcome(
+            client.send_goal_async(request), NAV_GOAL_RESPONSE_TIMEOUT_S)
+        if state != FUTURE_OK:
+            return "PLANNER_UNAVAILABLE", f"Path planning request failed: {exc or state}"
+        if not handle.accepted:
+            return "DESTINATION_UNREACHABLE", "Nav2 rejected the path planning request"
+        state, wrapped, exc = await self._await_future_outcome(
+            handle.get_result_async(), NAV_GOAL_RESPONSE_TIMEOUT_S)
+        if state != FUTURE_OK:
+            return "PLANNER_TIMEOUT", f"Path planning did not complete: {exc or state}"
+        result = wrapped.result
+        if wrapped.status != GoalStatus.STATUS_SUCCEEDED or not result.path.poses:
+            detail = getattr(result, "error_msg", "") or "No reachable path was found"
+            return "DESTINATION_UNREACHABLE", detail
+        return None
+
     def _believed_active(self) -> str:
         if self.active_navigation_type == NAV_NONE:
             return "NONE"
@@ -907,9 +1198,42 @@ class RobotGatewayNode(Node):
         return None
 
     async def _send_nav_goal_core(self, nav_type: str, client, goal_msg, request_id: str,
-                                  goals: List[Dict[str, Any]], frame: str) -> NavSendResult:
+                                  goals: List[Dict[str, Any]], frame: str,
+                                  timeout_seconds: float = None) -> NavSendResult:
+        if timeout_seconds is None:
+            timeout_seconds = getattr(self, 'default_navigation_timeout', DEFAULT_NAV_TIMEOUT_S)
+        async with self.navigation_lock:
+            motion_epoch = getattr(self, 'motion_epoch', 0)
+            admission = self._autonomy_error()
+            if admission:
+                return NavSendResult(*admission)
+            if self.active_goal_handle is not None:
+                await self._await_future(self.active_goal_handle.cancel_goal_async(),
+                                         timeout=NAV_CANCEL_WAIT_S)
+                deadline = time.monotonic() + NAV_CANCEL_WAIT_S
+                while self.active_goal_handle is not None:
+                    if time.monotonic() >= deadline:
+                        await self._fail_safe_stop()
+                        return NavSendResult('NAVIGATOR_CANCEL_TIMEOUT',
+                                             'Previous navigation did not stop')
+                    await asyncio.sleep(0.02)
+            planning = await self._preflight_path(nav_type, goal_msg)
+            if planning:
+                return NavSendResult(*planning)
+            admission = self._autonomy_error()
+            if admission:
+                return NavSendResult(*admission)
+            if motion_epoch != getattr(self, 'motion_epoch', 0):
+                return NavSendResult('NAVIGATION_SUPERSEDED',
+                                     'A motion command superseded this navigation request')
+            return await self._execute_nav_goal(
+                nav_type, client, goal_msg, request_id, goals, frame, timeout_seconds)
+
+    async def _execute_nav_goal(self, nav_type, client, goal_msg, request_id,
+                                goals, frame, timeout_seconds):
         """Send one goal, keeping every failure mode distinct, and log the whole request."""
         action = NAV_ACTION_NAMES[nav_type]
+        motion_epoch = self.motion_epoch
         info: Dict[str, Any] = {
             "request": request_id, "action": action, "nav_type": nav_type, "frame": frame,
             "goals": goals, "server_is_ready": client.server_is_ready(),
@@ -959,6 +1283,7 @@ class RobotGatewayNode(Node):
 
         if state == FUTURE_TIMEOUT:
             self.timed_out_goals[uuid_bytes] = request_id
+            await self._fail_safe_stop()
             return finish("ACTION_GOAL_RESPONSE_TIMEOUT",
                           f"No goal response from {action} within {NAV_GOAL_RESPONSE_TIMEOUT_S:.0f}s", accepted=None)
         if state == FUTURE_EXCEPTION:
@@ -966,50 +1291,130 @@ class RobotGatewayNode(Node):
         if not handle.accepted:
             return finish("NAV2_GOAL_REJECTED", f"Nav2 {action} returned accepted=false", accepted=False)
 
+        if motion_epoch != self.motion_epoch or self._autonomy_error():
+            await self._await_future(handle.cancel_goal_async(), timeout=NAV_CANCEL_WAIT_S)
+            canceled = await self._await_future(handle.get_result_async(), timeout=NAV_CANCEL_WAIT_S)
+            if canceled is None:
+                await self._fail_safe_stop()
+            return finish('NAVIGATION_SUPERSEDED',
+                          'Navigation was superseded while its response was pending')
+
         result_future = handle.get_result_async()
+        self.active_result_future = result_future
         self.active_navigation_type = nav_type
         self.active_goal_handle = handle
         self.active_goal_uuid = uuid_bytes
 
         def on_done(done_future, handle=handle, request=request_id, started=t_send):
+            status_name = "FAILED"
+            code = None
+            msg = ""
             try:
                 result = done_future.result()
                 code = getattr(result.result, "error_code", None)
                 msg = getattr(result.result, "error_msg", "")
+                status_name = ("TIMED_OUT" if uuid_bytes in self.timed_out_results
+                               else GOAL_STATUS_NAMES.get(result.status, str(result.status)))
                 LOGGER.info("nav_result request=%s goal_uuid=%s status=%s error_code=%s error_msg=%r duration_s=%.2f",
-                            request, uuid_bytes.hex(), GOAL_STATUS_NAMES.get(result.status, result.status),
+                            request, uuid_bytes.hex(), status_name,
                             code, msg, time.monotonic() - started)
             except Exception as exc:
+                msg = repr(exc)
                 LOGGER.warning("nav_result request=%s goal_uuid=%s result future failed: %r", request, uuid_bytes.hex(), exc)
+            timeout_task = self.goal_timeout_tasks.pop(uuid_bytes, None)
+            if timeout_task is not None:
+                timeout_task.cancel()
+            self.timed_out_results.discard(uuid_bytes)
+            self.broadcast_event("navigation_result", {
+                "requestId": request,
+                "goalId": uuid_bytes.hex(),
+                "action": action,
+                "status": status_name,
+                "errorCode": code,
+                "errorMessage": msg,
+                "durationSeconds": round(time.monotonic() - started, 3),
+            })
             if self.active_goal_handle is handle:
                 self.active_navigation_type = NAV_NONE
                 self.active_goal_handle = None
+                self.active_result_future = None
                 self.active_goal_uuid = b""
 
         result_future.add_done_callback(on_done)
+        self.goal_timeout_tasks[uuid_bytes] = asyncio.create_task(
+            self._enforce_navigation_timeout(
+                handle, result_future, uuid_bytes, request_id, timeout_seconds))
         info["accepted"] = True
         finish(None, "")
         return NavSendResult(None, "", handle, result_future)
 
     async def _send_nav_goal(self, ws: ServerConnection, msg_id: str | None, nav_type: str, client,
-                             goal_msg, goals: List[Dict[str, Any]], frame: str) -> None:
+                             goal_msg, goals: List[Dict[str, Any]], frame: str,
+                             timeout_seconds: float = DEFAULT_NAV_TIMEOUT_S) -> None:
         # A manual command replaces a running mission: end it, and its Nav2 goal, first.
         await self._cancel_mission_and_wait()
         request_id = msg_id or f"gw_{uuid.uuid4().hex[:8]}"
-        outcome = await self._send_nav_goal_core(nav_type, client, goal_msg, request_id, goals, frame)
+        admission = self._autonomy_error()
+        if admission:
+            await self.send_error(ws, msg_id, admission[0], admission[1])
+            return
+        outcome = await self._send_nav_goal_core(
+            nav_type, client, goal_msg, request_id, goals, frame, timeout_seconds)
         if outcome.code:
             await self.send_error(ws, msg_id, outcome.code, outcome.message)
             return
         await self.send_ack(ws, msg_id)
 
+    async def _enforce_navigation_timeout(self, handle, result_future, goal_uuid,
+                                          request_id, timeout_seconds):
+        try:
+            await asyncio.sleep(timeout_seconds)
+            if result_future.done():
+                return
+            self.timed_out_results.add(goal_uuid)
+            LOGGER.warning("navigation timeout request=%s goal_uuid=%s timeout_s=%.1f",
+                           request_id, goal_uuid.hex(), timeout_seconds)
+            await self._await_future(handle.cancel_goal_async(), timeout=NAV_CANCEL_WAIT_S)
+            deadline = time.monotonic() + NAV_CANCEL_WAIT_S
+            while not result_future.done() and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            if not result_future.done():
+                await self._fail_safe_stop()
+        except asyncio.CancelledError:
+            pass
+
+    async def _fail_safe_stop(self):
+        if self.srv_estop.service_is_ready():
+            await self._await_future(self.srv_estop.call_async(Trigger.Request()),
+                                     timeout=NAV_CANCEL_WAIT_S)
+
     def _goal_summary(self, point: Dict[str, Any]) -> Dict[str, Any]:
         return {"x": point.get("xMeters"), "y": point.get("yMeters"), "yaw": point.get("yawRadians")}
 
     async def handle_navigate_to(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
+        error = self._validate_point(payload)
+        if error:
+            await self.send_error(ws, msg_id, "INVALID_DESTINATION", error)
+            return
+        timeout = self._navigation_timeout(
+            payload, getattr(self, 'default_navigation_timeout', DEFAULT_NAV_TIMEOUT_S))
+        if timeout is None:
+            await self.send_error(ws, msg_id, "INVALID_ARGUMENT",
+                                  "timeoutSeconds must be between 1 and 3600")
+            return
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = self._pose_stamped(payload)
         await self._send_nav_goal(ws, msg_id, NAV_TO, self.nav_client, goal_msg,
-                                  [self._goal_summary(payload)], goal_msg.pose.header.frame_id)
+                                  [self._goal_summary(payload)], goal_msg.pose.header.frame_id,
+                                  timeout)
+
+    @staticmethod
+    def _navigation_timeout(payload, default_timeout=DEFAULT_NAV_TIMEOUT_S):
+        value = payload.get("timeoutSeconds", default_timeout)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        return value if math.isfinite(value) and 1.0 <= value <= MAX_NAV_TIMEOUT_S else None
 
     async def handle_navigate_through(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
         if not isinstance(payload, dict):
@@ -1020,7 +1425,10 @@ class RobotGatewayNode(Node):
         if not waypoints_data:
             await self.send_error(ws, msg_id, "INVALID_ARGUMENT", "Waypoints list cannot be empty")
             return
-
+        if not isinstance(waypoints_data, list) or len(waypoints_data) > 100:
+            await self.send_error(ws, msg_id, "INVALID_ARGUMENT",
+                                  "waypoints must be a list of at most 100 destinations")
+            return
         stop_on_failure = payload.get("stopOnFailure", True)
         if not isinstance(stop_on_failure, bool):
             await self.send_error(ws, msg_id, "INVALID_ARGUMENT", "stopOnFailure must be a Boolean")
@@ -1030,12 +1438,23 @@ class RobotGatewayNode(Node):
                 ws, msg_id, "UNSUPPORTED_ARGUMENT",
                 "Protocol v1 supports navigate_through only with stopOnFailure=true")
             return
+        for waypoint in waypoints_data:
+            error = RobotGatewayNode._validate_point(waypoint)
+            if error:
+                await self.send_error(ws, msg_id, "INVALID_DESTINATION", error)
+                return
+        timeout = RobotGatewayNode._navigation_timeout(
+            payload, getattr(self, 'default_navigation_timeout', DEFAULT_NAV_TIMEOUT_S))
+        if timeout is None:
+            await self.send_error(ws, msg_id, "INVALID_ARGUMENT",
+                                  "timeoutSeconds must be between 1 and 3600")
+            return
 
         goal_msg = NavigateThroughPoses.Goal()
         goal_msg.poses.header.frame_id = "map"
         goal_msg.poses.goals = [self._pose_stamped(wp) for wp in waypoints_data]
         await self._send_nav_goal(ws, msg_id, NAV_THROUGH, self.nav_through_client, goal_msg,
-                                  [self._goal_summary(wp) for wp in waypoints_data], "map")
+                                  [self._goal_summary(wp) for wp in waypoints_data], "map", timeout)
 
     async def handle_cancel_navigation(self, ws: ServerConnection, msg_id: str | None):
         await self._cancel_mission_and_wait()
@@ -1047,11 +1466,24 @@ class RobotGatewayNode(Node):
             return
 
         for client in ready:
-            await self._await_future(client.call_async(CancelGoal.Request()), timeout=5.0)
+            result = await self._await_future(client.call_async(CancelGoal.Request()), timeout=5.0)
+            if result is None:
+                await self._fail_safe_stop()
+                await self.send_error(ws, msg_id, 'NAVIGATOR_CANCEL_TIMEOUT',
+                                      'Navigation cancellation did not respond')
+                return
+        deadline = time.monotonic() + NAV_CANCEL_WAIT_S
+        while self.active_goal_handle is not None or any(self.status_active.values()):
+            if time.monotonic() >= deadline:
+                await self._fail_safe_stop()
+                await self.send_error(ws, msg_id, 'NAVIGATOR_CANCEL_TIMEOUT',
+                                      'Navigation has not reached a terminal state')
+                return
+            await asyncio.sleep(0.02)
         await self.send_ack(ws, msg_id)
 
     async def handle_list_maps(self, ws: ServerConnection, msg_id: str | None):
-        if not self.srv_list_maps.service_is_ready():
+        if not await RobotGatewayNode._ensure_map_service(self, 'srv_list_maps', ListMaps):
             await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", "ListMaps service is unavailable")
             return
 
@@ -1080,7 +1512,7 @@ class RobotGatewayNode(Node):
             await self.send_error(ws, msg_id, "INVALID_MAP_ID", "Map ID contains invalid characters or path traversal attempt")
             return
 
-        if not self.srv_switch_map.service_is_ready():
+        if not await RobotGatewayNode._ensure_map_service(self, 'srv_switch_map', ActivateMap):
             await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", "ActivateMap service is unavailable")
             return
 
@@ -1095,9 +1527,10 @@ class RobotGatewayNode(Node):
             await self.send_error(ws, msg_id, (res.error_code if res else "") or "MAP_SWITCH_FAILED", msg)
 
     async def handle_save_map(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
-        name = payload.get("name", "").strip()
-        if not name:
-            await self.send_error(ws, msg_id, "INVALID_MAP_NAME", "Map name cannot be empty")
+        value = payload.get('name', '')
+        name = value.strip() if isinstance(value, str) else ''
+        if not name or len(name) > 128 or any(ord(char) < 32 for char in name):
+            await self.send_error(ws, msg_id, "INVALID_MAP_NAME", "Map name must be 1..128 printable characters")
             return
 
         map_id = re.sub(r'[^a-zA-Z0-9_\-]', '_', name.lower())
@@ -1105,14 +1538,18 @@ class RobotGatewayNode(Node):
             await self.send_error(ws, msg_id, "INVALID_MAP_ID", "Derived map ID contains invalid characters")
             return
 
-        if not self.srv_save_map.service_is_ready():
+        if not await RobotGatewayNode._ensure_map_service(self, 'srv_save_map', SaveMap):
             await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", "SaveMap service is unavailable")
             return
 
         req = SaveMap.Request()
         req.map_id = map_id
         req.display_name = name
-        req.overwrite = True
+        overwrite = payload.get("overwrite", False)
+        if not isinstance(overwrite, bool):
+            await self.send_error(ws, msg_id, "INVALID_ARGUMENT", "overwrite must be a Boolean")
+            return
+        req.overwrite = overwrite
         res = await self._await_future(
             self.srv_save_map.call_async(req), timeout=MAP_ADMISSION_TIMEOUT)
         if res and res.success:
@@ -1123,15 +1560,16 @@ class RobotGatewayNode(Node):
 
     async def handle_rename_map(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
         map_id = payload.get("mapId", "")
-        new_name = payload.get("newName", "").strip()
+        value = payload.get('newName', '')
+        new_name = value.strip() if isinstance(value, str) else ''
         if not is_valid_map_id(map_id):
             await self.send_error(ws, msg_id, "INVALID_MAP_ID", "Map ID contains invalid characters or path traversal attempt")
             return
-        if not new_name:
-            await self.send_error(ws, msg_id, "INVALID_MAP_NAME", "New map name cannot be empty")
+        if not new_name or len(new_name) > 128 or any(ord(char) < 32 for char in new_name):
+            await self.send_error(ws, msg_id, "INVALID_MAP_NAME", "New name must be 1..128 printable characters")
             return
 
-        if not self.srv_rename_map.service_is_ready():
+        if not await RobotGatewayNode._ensure_map_service(self, 'srv_rename_map', RenameMap):
             await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", "RenameMap service is unavailable")
             return
 
@@ -1159,7 +1597,7 @@ class RobotGatewayNode(Node):
             await self.send_error(ws, msg_id, "INVALID_MAP_ID", "Map ID contains invalid characters or path traversal attempt")
             return
 
-        if not self.srv_delete_map.service_is_ready():
+        if not await RobotGatewayNode._ensure_map_service(self, 'srv_delete_map', DeleteMap):
             await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", "DeleteMap service is unavailable")
             return
 
@@ -1172,33 +1610,77 @@ class RobotGatewayNode(Node):
             msg = res.message if res else "Delete map failed"
             await self.send_error(ws, msg_id, (res.error_code if res else "") or "MAP_DELETE_FAILED", msg)
 
-    async def handle_start_mapping(self, ws: ServerConnection, msg_id: str | None):
-        if not self.srv_start_mapping.service_is_ready():
-            await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", "StartMapping service is unavailable")
+    async def handle_start_mapping(self, ws: ServerConnection, msg_id: str | None,
+                                   payload: Dict[str, Any]):
+        """Validate explicit recovery choices and await only ROS transition admission."""
+        resume = payload.get("resumeUnsaved", False)
+        discard = payload.get("discardUnsaved", False)
+        LOGGER.info('[MAPPING] Request received id=%s resumeUnsaved=%s discardUnsaved=%s',
+                    msg_id, resume if isinstance(resume, bool) else '<invalid>',
+                    discard if isinstance(discard, bool) else '<invalid>')
+        if not isinstance(resume, bool) or not isinstance(discard, bool) or (resume and discard):
+            await self.send_error(ws, msg_id, "INVALID_ARGUMENT",
+                                  "resumeUnsaved and discardUnsaved must be exclusive Booleans",
+                                  subsystem='mapping')
             return
+        await RobotGatewayNode._mapping_service_command(
+            self, ws, msg_id, 'srv_start_mapping', StartMapping,
+            StartMapping.Request(resume_unsaved=resume, discard_unsaved=discard))
 
-        res = await self._await_future(
-            self.srv_start_mapping.call_async(StartMapping.Request()), timeout=MAP_ADMISSION_TIMEOUT)
-        if res and res.success:
-            await self.send_ack(ws, msg_id)
-        else:
-            msg = res.message if res else "Start mapping failed"
-            await self.send_error(ws, msg_id, (res.error_code if res else "") or "MAPPING_START_FAILED", msg)
+    async def _mapping_service_command(self, ws, msg_id, attribute, service_type, request):
+        """Wait only for admission, retaining transport failures and ROS rejection details."""
+        started = time.monotonic()
+        try:
+            available = await RobotGatewayNode._ensure_map_service(self, attribute, service_type)
+            LOGGER.info('[MAPPING] ROS service availability id=%s service=%s ready=%s',
+                        msg_id, attribute, available)
+            if not available:
+                await self.send_error(ws, msg_id, 'SERVICE_UNAVAILABLE',
+                                      f'{service_type.__name__} service is unavailable', subsystem='mapping')
+                return
+            LOGGER.info('[MAPPING] ROS service call started id=%s service=%s', msg_id, attribute)
+            outcome, res, exc = await self._await_future_outcome(
+                getattr(self, attribute).call_async(request), timeout=MAP_ADMISSION_TIMEOUT)
+            if outcome == FUTURE_TIMEOUT:
+                await self.send_error(ws, msg_id, 'SERVICE_TIMEOUT',
+                                      f'{service_type.__name__} admission timed out; check map_state before retrying',
+                                      subsystem='mapping')
+            elif outcome == FUTURE_EXCEPTION:
+                LOGGER.error('[MAPPING] ROS service exception id=%s: %s', msg_id, exc)
+                await self.send_error(ws, msg_id, 'INTERNAL_ERROR', str(exc), subsystem='mapping')
+            elif res is None:
+                await self.send_error(ws, msg_id, 'INTERNAL_ERROR',
+                                      'Mapping service returned no response', subsystem='mapping')
+            else:
+                LOGGER.info('[MAPPING] ROS service response id=%s accepted=%s code=%s message=%s',
+                            msg_id, res.success, res.error_code, res.message)
+                if res.success:
+                    await self.send_ack(ws, msg_id)
+                    LOGGER.info('[MAPPING] WebSocket acknowledgement sent id=%s', msg_id)
+                else:
+                    await self.send_error(ws, msg_id, res.error_code or 'MAPPING_FAILED',
+                                          res.message, subsystem='mapping')
+            LOGGER.info('[MAPPING] WebSocket response sent id=%s', msg_id)
+        except websockets.ConnectionClosed:
+            LOGGER.info('[MAPPING] Client disconnected id=%s; ROS transition remains authoritative', msg_id)
+        except Exception as exc:
+            LOGGER.exception('[MAPPING] Command failed id=%s', msg_id)
+            await self.send_error(ws, msg_id, 'INTERNAL_ERROR', str(exc), subsystem='mapping')
+        finally:
+            LOGGER.info('[MAPPING] Request completed id=%s elapsed=%.3fs',
+                        msg_id, time.monotonic() - started)
 
     async def handle_stop_mapping(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
-        if not self.srv_stop_mapping.service_is_ready():
-            await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE", "StopMapping service is unavailable")
-            return
-
+        """Require a Boolean discard decision and propagate stop admission outcomes."""
         req = StopMapping.Request()
-        req.discard_unsaved = bool(payload.get("discardUnsaved", False))
-        res = await self._await_future(
-            self.srv_stop_mapping.call_async(req), timeout=MAP_ADMISSION_TIMEOUT)
-        if res and res.success:
-            await self.send_ack(ws, msg_id)
-        else:
-            msg = res.message if res else "Stop mapping failed"
-            await self.send_error(ws, msg_id, (res.error_code if res else "") or "MAPPING_STOP_FAILED", msg)
+        discard = payload.get('discardUnsaved', False)
+        if not isinstance(discard, bool):
+            await self.send_error(ws, msg_id, 'INVALID_ARGUMENT', 'discardUnsaved must be a Boolean',
+                                  subsystem='mapping')
+            return
+        req.discard_unsaved = discard
+        await RobotGatewayNode._mapping_service_command(
+            self, ws, msg_id, 'srv_stop_mapping', StopMapping, req)
 
     async def handle_list_virtual_walls(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
         map_id = payload.get("mapId", "")
@@ -1725,6 +2207,9 @@ class RobotGatewayNode(Node):
                     getattr(response, "return_code", None), exc)
         state, _, exc = await self._await_future_outcome(result_future, NAV_CANCEL_WAIT_S)
         LOGGER.info("nav_cancel request=%s terminal_result=%s exception=%r", request_id, state, exc)
+        if state != FUTURE_OK:
+            await self._fail_safe_stop()
+            raise MissionFailure('Navigation cancellation could not be confirmed; safety stop engaged')
 
     async def _mission_dock(self, client, target_state: int, name: str):
         if not client.service_is_ready():
@@ -1883,6 +2368,84 @@ class RobotGatewayNode(Node):
         }
         await ws.send(safe_dumps(resp))
 
+    async def handle_subscribe_map(self, ws: ServerConnection, msg_id: str | None):
+        self.map_subscribers.add(ws)
+        await self.send_ack(ws, msg_id)
+        if self.map_stream.available:
+            await self.handle_map_snapshot(ws, None)
+
+    async def handle_map_snapshot(self, ws: ServerConnection, msg_id: str | None):
+        if not self.map_stream.available:
+            await self.send_error(ws, msg_id, "MAP_UNAVAILABLE", "No occupancy grid is available")
+            return
+        response = {"type": "map_snapshot", "protocolVersion": PROTOCOL_VERSION,
+                    "payload": self.map_stream.snapshot()}
+        if msg_id:
+            response["id"] = msg_id
+        encoded = safe_dumps(response)
+        if len(encoded.encode("utf-8")) > MAX_MESSAGE_SIZE_BYTES:
+            await self.send_error(ws, msg_id, "PAYLOAD_TOO_LARGE",
+                                  "Encoded map snapshot exceeds the gateway limit")
+            return
+        await ws.send(encoded)
+
+    def _map_cell_is_free(self, x: float, y: float) -> bool:
+        if not self.map_stream.available:
+            return False
+        origin = self.map_stream.origin
+        position, q = origin["position"], origin["orientation"]
+        yaw = math.atan2(2.0 * (q["w"] * q["z"] + q["x"] * q["y"]),
+                         1.0 - 2.0 * (q["y"] * q["y"] + q["z"] * q["z"]))
+        dx, dy = x - position["x"], y - position["y"]
+        local_x = math.cos(yaw) * dx + math.sin(yaw) * dy
+        local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy
+        column = math.floor(local_x / self.map_stream.resolution)
+        row = math.floor(local_y / self.map_stream.resolution)
+        if not (0 <= column < self.map_stream.width and 0 <= row < self.map_stream.height):
+            return False
+        occupancy = self.map_stream.cells[row * self.map_stream.width + column]
+        return 0 <= occupancy < 50
+
+    async def handle_set_initial_pose(self, ws: ServerConnection, msg_id: str | None,
+                                      payload: Dict[str, Any]):
+        error = self._validate_point(payload)
+        if error:
+            await self.send_error(ws, msg_id, "INVALID_INITIAL_POSE", error)
+            return
+        x, y = float(payload["xMeters"]), float(payload["yMeters"])
+        if not self.last_map_state or self.last_map_state.get("state") != "ACTIVE":
+            await self.send_error(ws, msg_id, "MAP_NOT_ACTIVE", "An active map is required")
+            return
+        if not self._map_cell_is_free(x, y):
+            await self.send_error(ws, msg_id, "INITIAL_POSE_OCCUPIED",
+                                  "Initial pose is outside the map or in an occupied cell")
+            return
+        yaw = float(payload.get("yawRadians", 0.0))
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = "map"
+        msg.header.stamp = Time().to_msg()  # use latest TF; gateway timers use wall time
+        msg.pose.pose.position.x, msg.pose.pose.position.y = x, y
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        msg.pose.covariance[0] = msg.pose.covariance[7] = 0.25
+        msg.pose.covariance[35] = 0.0685
+        self.initial_pose_pub.publish(msg)
+        await self.send_ack(ws, msg_id)
+
+    async def handle_reinitialize_localization(self, ws: ServerConnection,
+                                               msg_id: str | None):
+        if not self.srv_global_localization.service_is_ready():
+            await self.send_error(ws, msg_id, "SERVICE_UNAVAILABLE",
+                                  "AMCL global localization service is unavailable")
+            return
+        result = await self._await_future(
+            self.srv_global_localization.call_async(Empty.Request()), timeout=10.0)
+        if result is None:
+            await self.send_error(ws, msg_id, "LOCALIZATION_RECOVERY_FAILED",
+                                  "AMCL global localization request failed")
+            return
+        await self.send_ack(ws, msg_id)
+
     async def handle_get_recent_logs(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
         try:
             limit = int(payload.get("limit", 100))
@@ -1902,7 +2465,8 @@ class RobotGatewayNode(Node):
         await ws.send(safe_dumps(resp))
 
     async def send_ack(self, ws: ServerConnection, msg_id: str | None):
-        if msg_id:
+        # Keep even an empty or numeric supplied ID rather than dropping its correlation.
+        if msg_id is not None:
             await ws.send(safe_dumps({
                 "type": "command_ack",
                 "id": msg_id,
@@ -1910,6 +2474,7 @@ class RobotGatewayNode(Node):
             }))
 
     async def send_error(self, ws: ServerConnection, msg_id: str | None, code: str, message: str, subsystem: str = "gateway", recoverable: bool = True):
+        """Send the canonical error envelope with its original correlation ID."""
         resp = {
             "type": "command_error",
             "protocolVersion": PROTOCOL_VERSION,
@@ -1921,9 +2486,11 @@ class RobotGatewayNode(Node):
                 "recoverable": recoverable
             }
         }
-        if msg_id:
+        if msg_id is not None:
             resp["id"] = msg_id
         await ws.send(safe_dumps(resp))
+        if subsystem == 'mapping':
+            LOGGER.info('[MAPPING] WebSocket error sent id=%s code=%s', msg_id, code)
 
 
 async def _monitor_loop(node: RobotGatewayNode):
@@ -1988,7 +2555,8 @@ async def run_gateway(node: RobotGatewayNode):
 
     monitor = asyncio.create_task(_monitor_loop(node))
     discovery = asyncio.create_task(_discovery_loop(node)) if node.discovery_enabled else None
-    async with serve(node.handle_client, node.host, node.port):
+    async with serve(node.handle_client, node.host, node.port,
+                     max_size=MAX_MESSAGE_SIZE_BYTES):
         LOGGER.info("Robot Gateway listening on ws://%s:%d", node.host, node.port)
         last_batch_start = time.monotonic()
         while not stop_event.is_set():

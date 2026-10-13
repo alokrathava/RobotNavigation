@@ -1,1 +1,1 @@
-{"type":"navigate_to","id":"cmd-nav-1","protocolVersion":1,"payload":{"xMeters":5.0,"yMeters":2.5,"yawRadians":1.57}}
+{"type":"navigate_to","id":"cmd-nav-1","protocolVersion":1,"payload":{"xMeters":5.0,"yMeters":2.5,"yawRadians":1.57,"timeoutSeconds":300}}

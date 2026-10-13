@@ -2,6 +2,8 @@
 """Cross-language Protocol v1 fixture tests for robot_gateway."""
 
 import json
+import base64
+import zlib
 import os
 from pathlib import Path
 import unittest
@@ -24,15 +26,20 @@ REQUIRED_FIXTURES = {
     "hello.json", "hello_ack.json", "list_maps.json", "list_maps_ack.json",
     "list_saved_locations.json", "list_saved_locations_ack.json",
     "list_virtual_walls.json", "list_virtual_walls_ack.json", "manual_velocity.json",
-    "map_state.json", "mission_progress.json", "navigate_through.json",
-    "navigate_to.json", "navigate_to_location.json", "ping.json", "pong.json",
-    "release_emergency_stop.json", "rename_location.json", "rename_location_ack.json",
-    "rename_map.json", "rename_map_ack.json", "request_state_snapshot.json",
+    "map_snapshot.json", "map_state.json", "map_update.json", "mission_progress.json",
+    "navigate_through.json", "navigate_to.json", "navigate_to_location.json",
+    "navigation_path.json", "navigation_result.json", "ping.json", "pong.json",
+    "reinitialize_localization.json", "release_emergency_stop.json",
+    "rename_location.json", "rename_location_ack.json",
+    "rename_map.json", "rename_map_ack.json", "request_map_snapshot.json",
+    "request_state_snapshot.json",
     "robot_discovery_beacon.json", "robot_health.json", "robot_state_snapshot.json",
     "safety_state.json", "save_location.json", "save_location_ack.json", "save_map.json",
-    "set_virtual_wall_enabled.json", "start_mapping.json", "stop.json",
+    "set_initial_pose.json", "set_virtual_wall_enabled.json", "start_mapping.json",
+    "stop.json", "subscribe_map.json", "subscribe_navigation_path.json",
     "stop_mapping.json", "submit_mission.json", "switch_map.json", "telemetry.json",
-    "undock.json", "update_motion_limits.json", "update_virtual_wall.json",
+    "undock.json", "unsubscribe_map.json", "unsubscribe_navigation_path.json",
+    "update_motion_limits.json", "update_virtual_wall.json",
     "update_virtual_wall_ack.json",
 }
 
@@ -86,6 +93,13 @@ class TestProtocolFixtures(unittest.TestCase):
         snapshot = self.load("robot_state_snapshot.json")["payload"]
         self.assertNotIn("map", snapshot)
         self.assertEqual(event, snapshot["mapState"])
+
+    def test_grid_fixture_encoding_decodes_to_declared_cell_count(self):
+        for filename in ('map_snapshot.json', 'map_update.json'):
+            payload = self.load(filename)['payload']
+            cells = zlib.decompress(base64.b64decode(payload['data'], validate=True))
+            self.assertEqual(payload['cellCount'], len(cells))
+            self.assertEqual(payload['width'] * payload['height'], len(cells))
 
     def test_long_running_map_commands_use_generic_acceptance_ack(self):
         ack = self.load("command_ack.json")

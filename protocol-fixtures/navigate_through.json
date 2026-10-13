@@ -1,1 +1,1 @@
-{"type":"navigate_through","id":"cmd-nav-2","protocolVersion":1,"payload":{"waypoints":[{"xMeters":1.0,"yMeters":2.0,"yawRadians":0.0},{"xMeters":3.0,"yMeters":4.0,"yawRadians":1.57}],"stopOnFailure":true}}
+{"type":"navigate_through","id":"cmd-nav-2","protocolVersion":1,"payload":{"waypoints":[{"xMeters":1.0,"yMeters":2.0,"yawRadians":0.0},{"xMeters":3.0,"yMeters":4.0,"yawRadians":1.57}],"stopOnFailure":true,"timeoutSeconds":300}}

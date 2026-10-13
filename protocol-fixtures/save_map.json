@@ -1,1 +1,1 @@
-{"type":"save_map","id":"cmd-save-1","protocolVersion":1,"payload":{"name":"Warehouse A"}}
+{"type":"save_map","id":"cmd-save-1","protocolVersion":1,"payload":{"name":"Warehouse A","overwrite":false}}

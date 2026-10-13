@@ -20,6 +20,8 @@ install(
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(map_manager_transitions test/test_map_manager_transitions.py)
+  ament_add_pytest_test(map_manager_persistence test/test_map_manager_persistence.py)
+  ament_add_pytest_test(safety_supervisor test/test_safety_supervisor.py)
 endif()
 
 ament_package()

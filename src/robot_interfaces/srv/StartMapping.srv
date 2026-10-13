@@ -1,6 +1,7 @@
+bool resume_unsaved
+bool discard_unsaved
 ---
 bool success
 string error_code
 string message
 robot_interfaces/MapState state
-

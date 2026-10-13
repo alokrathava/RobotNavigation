@@ -1,0 +1,1 @@
+{"type":"navigation_result","protocolVersion":1,"payload":{"requestId":"cmd-nav-1","goalId":"00112233445566778899aabbccddeeff","action":"navigate_to_pose","status":"SUCCEEDED","errorCode":0,"errorMessage":"","durationSeconds":12.4}}

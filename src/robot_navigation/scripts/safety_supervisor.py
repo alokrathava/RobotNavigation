@@ -12,7 +12,7 @@ from geometry_msgs.msg import TwistStamped
 from nav2_msgs.msg import CollisionMonitorState
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from robot_interfaces.msg import SafetyState
+from robot_interfaces.msg import MapState, SafetyState
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
 from std_srvs.srv import SetBool, Trigger
@@ -38,6 +38,10 @@ class SafetySupervisor(Node):
         self.estop = False
         self.release_hold = False       # E-stop released, waiting for manual stream to go quiet
         self.transition_hold = False    # map lifecycle inhibits all commanded motion
+        self.transition_release_hold = False
+        self.transition_release_at = 0.0
+        self.manual_takeover_hold = False
+        self.autonomy_allowed = False
         self.last_out_zero = True
         self.last_safe_rx = None
         self.last_manual_rx = None
@@ -63,6 +67,7 @@ class SafetySupervisor(Node):
         self.create_subscription(TwistStamped, 'cmd_vel_manual', self.on_manual, 10)
         self.create_subscription(TwistStamped, 'cmd_vel_nav', self.on_nav, 10)
         self.create_subscription(LaserScan, 'scan', self.on_scan, 10)
+        self.create_subscription(MapState, '/robot/map/state', self.on_map_state, latched)
         self.create_subscription(CollisionMonitorState, 'collision_monitor_state',
                                  self.on_collision, 10)
         self.cancel_clients = {}
@@ -101,19 +106,31 @@ class SafetySupervisor(Node):
         self.last_out_zero = is_zero(msg)
         self.cmd_pub.publish(msg)
 
-    def cancel_navigation(self):
+    def cancel_navigation(self, force=False):
         for action, client in self.cancel_clients.items():
-            if self.active_goals[action] and client.service_is_ready():
+            if (force or self.active_goals[action]) and client.service_is_ready():
                 client.call_async(CancelGoal.Request())  # zero goal id = cancel all
 
     # ---- subscriptions ----
     def on_safe(self, msg):
         self.last_safe_rx = self.now_s()
         self.fault = False
-        if self.estop or self.release_hold or self.transition_hold:
+        scan_stale = self.age(self.last_scan_rx) > self.scan_timeout
+        unlocalized_nav = (not getattr(self, 'autonomy_allowed', True)
+                           and self.age(self.last_nav_rx) < self.nav_timeout
+                           and not self.manual_active())
+        if (self.estop or self.release_hold or self.transition_hold
+                or self.transition_release_hold or self.manual_takeover_hold
+                or unlocalized_nav
+                or (scan_stale and not is_zero(msg))):
             self.publish_cmd(self.zero_cmd())
+            if scan_stale and not is_zero(msg):
+                self.fault = True
+                self.cancel_navigation(force=True)
         else:
             self.publish_cmd(msg)
+        if self.transition_release_hold and is_zero(msg):
+            self.transition_release_hold = False
 
     def on_manual(self, msg):
         if self.synthetic_zeros:
@@ -121,9 +138,11 @@ class SafetySupervisor(Node):
             return
         self.last_manual_rx = self.now_s()
         self.last_manual_zero = is_zero(msg)
-        if not self.estop and any(self.active_goals.values()):
-            self.get_logger().info('Manual input: cancelling active navigation goal')
-            self.cancel_navigation()
+        if not self.estop and not self.last_manual_zero:
+            if any(self.active_goals.values()):
+                self.get_logger().info('Manual input: cancelling active navigation goal')
+                self.manual_takeover_hold = True
+            self.cancel_navigation(force=True)
 
     def on_nav(self, _msg):
         self.last_nav_rx = self.now_s()
@@ -131,13 +150,28 @@ class SafetySupervisor(Node):
     def on_scan(self, _msg):
         self.last_scan_rx = self.now_s()
 
+    def on_map_state(self, msg):
+        self.autonomy_allowed = (msg.state == MapState.ACTIVE
+                                 and msg.mode == MapState.MODE_LOCALIZATION
+                                 and msg.localization_ready)
+        if not self.autonomy_allowed:
+            self.cancel_navigation(force=True)
+            if not self.manual_active():
+                self.publish_cmd(self.zero_cmd())
+
     def on_collision(self, msg):
         self.collision_action = msg.action_type
 
     def on_status(self, action, msg):
         self.active_goals[action] = any(s.status in ACTIVE for s in msg.status_list)
-        if self.estop and self.active_goals[action]:
+        if self.manual_active() and self.active_goals[action]:
+            self.manual_takeover_hold = True
+            self.cancel_navigation(force=True)
+        if ((self.estop or (action in ('navigate_to_pose', 'navigate_through_poses')
+                            and not self.autonomy_allowed)) and self.active_goals[action]):
             self.cancel_navigation()
+        if not any(self.active_goals.values()) and not self.manual_active():
+            self.manual_takeover_hold = False
 
     # ---- services ----
     def srv_estop(self, _req, res):
@@ -176,9 +210,18 @@ class SafetySupervisor(Node):
     def srv_transition_hold(self, req, res):
         self.transition_hold = bool(req.data)
         if self.transition_hold:
+            self.transition_release_hold = False
             self.publish_cmd(self.zero_cmd())
             self.lock_pub.publish(Bool(data=True))
-            self.cancel_navigation()
+            self.cancel_navigation(force=True)
+        else:
+            # A new zero from the live velocity pipeline proves stale pre-transition
+            # commands have drained before the final gate opens.
+            self.transition_release_hold = True
+            self.transition_release_at = self.now_s() + max(
+                self.watchdog_timeout, self.manual_timeout, self.nav_timeout) + 0.1
+            self.synthetic_zeros += 1
+            self.manual_pub.publish(self.zero_cmd())
         res.success = True
         res.message = 'map transition motion hold enabled' if self.transition_hold else \
             'map transition motion hold released'
@@ -187,18 +230,26 @@ class SafetySupervisor(Node):
 
     # ---- periodic ----
     def on_tick(self):
-        if self.estop or self.transition_hold:
+        if (self.transition_release_hold and self.now_s() >= self.transition_release_at
+                and not self.manual_active() and not any(self.active_goals.values())):
+            self.publish_cmd(self.zero_cmd())
+            self.last_safe_rx = None
+            self.transition_release_hold = False
+        if self.estop or self.transition_hold or self.transition_release_hold:
             self.publish_cmd(self.zero_cmd())
             self.lock_pub.publish(Bool(data=True))
             return
 
         if self.release_hold:
-            if self.manual_active():
+            if (self.manual_active() or any(self.active_goals.values())
+                    or self.age(self.last_nav_rx) < self.nav_timeout):
+                self.cancel_navigation(force=True)
                 self.lock_pub.publish(Bool(data=True))
                 self.publish_cmd(self.zero_cmd())
                 return
             self.release_hold = False
-            self.get_logger().info('Manual stream quiet: motion re-enabled')
+            self.last_safe_rx = None
+            self.get_logger().info('Command streams quiet and goals stopped: motion re-enabled')
         self.lock_pub.publish(Bool(data=False))
 
         # Dead-man: take over the mux with zero so the smoother decelerates at once
@@ -210,6 +261,13 @@ class SafetySupervisor(Node):
             self.dead_man_count += 1
             self.last_dead_man = self.get_clock().now().to_msg()
             self.get_logger().info('Manual dead-man timeout: zero velocity')
+
+        if self.manual_takeover_hold:
+            if any(self.active_goals.values()):
+                self.publish_cmd(self.zero_cmd())
+                self.lock_pub.publish(Bool(data=True))
+                return
+            self.manual_takeover_hold = False
 
         # DiffDrive holds its last command, so zero it if the pipeline goes silent.
         if not self.last_out_zero and self.age(self.last_safe_rx) > self.watchdog_timeout:
@@ -224,7 +282,9 @@ class SafetySupervisor(Node):
         state.dead_man_stop_count = self.dead_man_count
         if self.last_dead_man is not None:
             state.last_dead_man_stop = self.last_dead_man
-        state.motion_inhibited = self.estop or self.release_hold or self.transition_hold
+        state.motion_inhibited = (self.estop or self.release_hold or self.transition_hold
+                                  or self.transition_release_hold
+                                  or self.manual_takeover_hold)
         if self.age(self.last_manual_rx) < self.manual_timeout:
             state.control_source = 'manual'
         elif self.age(self.last_nav_rx) < self.nav_timeout:
@@ -246,7 +306,7 @@ class SafetySupervisor(Node):
             state.state, state.detail = SafetyState.CAUTION, 'obstacle in slow zone'
         else:
             state.state = SafetyState.NORMAL
-            state.detail = 'waiting for manual input to go quiet' if self.release_hold else ''
+            state.detail = 'waiting for command streams and goals to stop' if self.release_hold else ''
         self.state_pub.publish(state)
 
 

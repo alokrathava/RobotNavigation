@@ -3,11 +3,15 @@
 import asyncio
 import json
 import math
+import time
 import unittest
 from types import SimpleNamespace
 
 from robot_gateway import gateway_node
 from robot_gateway.gateway_node import RobotGatewayNode
+from robot_gateway.map_stream import MapStreamState
+from robot_interfaces.msg import MapState
+from nav_msgs.msg import OccupancyGrid
 
 
 class _FakeTwistStamped:
@@ -89,7 +93,8 @@ class _NavigateThroughHarness:
     def _goal_summary(point):
         return point
 
-    async def _send_nav_goal(self, _ws, msg_id, nav_type, client, goal, goals, frame):
+    async def _send_nav_goal(self, _ws, msg_id, nav_type, client, goal, goals, frame,
+                             timeout_seconds=300.0):
         self.sent.append((msg_id, nav_type, client, goal, goals, frame))
 
 
@@ -251,6 +256,44 @@ class TestEmergencyStopOwnership(unittest.IsolatedAsyncioTestCase):
 
 
 class TestProtocolContract(unittest.IsolatedAsyncioTestCase):
+    def test_map_activation_resynchronizes_cached_grid_identity(self):
+        grid = OccupancyGrid()
+        grid.header.frame_id = 'map'
+        grid.info.width = grid.info.height = 2
+        grid.info.resolution = 0.05
+        grid.info.origin.orientation.w = 1.0
+        grid.data = [0, 0, 0, 0]
+        stream = MapStreamState()
+        stream.ingest_full(grid, 'old', 'LOCALIZATION')
+        harness = SimpleNamespace(map_stream=stream, pending_map_event=None,
+                                  last_map_state=None, broadcast_event=lambda *args: None)
+        state = MapState()
+        state.state, state.mode = MapState.ACTIVE, MapState.MODE_LOCALIZATION
+        state.active_map_id = 'new'
+        RobotGatewayNode.on_map_state(harness, state)
+        self.assertEqual('map_snapshot', harness.pending_map_event[0])
+        self.assertEqual('new', harness.pending_map_event[1]['mapId'])
+        self.assertEqual(2, harness.pending_map_event[1]['sequence'])
+    def test_autonomy_gate_requires_fresh_localized_safe_state(self):
+        harness = SimpleNamespace(
+            last_map_state={"state": "ACTIVE", "localizationReady": True},
+            runtime_ready=True,
+            last_telemetry={"poseValid": True, "localizationState": "LOCALIZED"},
+            last_telemetry_at=time.monotonic(),
+            last_safety={"emergencyStopActive": False, "motionInhibited": False},
+        )
+        self.assertIsNone(RobotGatewayNode._autonomy_error(harness))
+        harness.last_map_state["localizationReady"] = False
+        self.assertEqual("LOCALIZATION_NOT_READY",
+                         RobotGatewayNode._autonomy_error(harness)[0])
+
+    def test_navigation_timeout_is_bounded_and_finite(self):
+        self.assertEqual(300.0, RobotGatewayNode._navigation_timeout({}))
+        self.assertEqual(1.0, RobotGatewayNode._navigation_timeout({"timeoutSeconds": 1}))
+        self.assertIsNone(RobotGatewayNode._navigation_timeout({"timeoutSeconds": 0}))
+        self.assertIsNone(RobotGatewayNode._navigation_timeout(
+            {"timeoutSeconds": float("nan")}))
+
     def test_discovery_auto_mode_only_enables_for_lan_gateway(self):
         self.assertFalse(gateway_node.discovery_is_enabled("127.0.0.1", "auto"))
         self.assertTrue(gateway_node.discovery_is_enabled("0.0.0.0", "auto"))
