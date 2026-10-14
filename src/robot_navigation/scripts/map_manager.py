@@ -572,24 +572,37 @@ class MapManager(Node):
             self.transition_lock.release()
 
     def call(self, client, request, unavailable, timeout=30.0):
-        if not client.wait_for_service(timeout_sec=5.0):
-            raise MapFailure(unavailable, f'{client.srv_name} unavailable')
-        done = threading.Event()
-        holder = {}
-        future = client.call_async(request)
-        def complete(result):
-            try:
-                holder['result'] = result.result()
-            except Exception as exc:  # callback records, service thread reports consistently
-                holder['error'] = exc
-            done.set()
-        future.add_done_callback(complete)
-        if not done.wait(timeout):
-            future.cancel()
-            raise MapFailure(unavailable, f'{client.srv_name} response timeout')
-        if holder.get('result') is None:
-            raise MapFailure(unavailable, f'{client.srv_name} call failed: {holder.get("error")}')
-        return holder['result']
+        """Refresh a stale discovery handle once before sending, never replaying a request."""
+        temporary_client = None
+        try:
+            if not client.wait_for_service(timeout_sec=5.0):
+                self.get_logger().warning(f'Retrying discovery with a fresh client: {client.srv_name}')
+                temporary_client = self.create_client(
+                    client.srv_type, client.srv_name, qos_profile=client.qos_profile,
+                    callback_group=client.callback_group)
+                client = temporary_client
+                if not client.wait_for_service(timeout_sec=5.0):
+                    raise MapFailure(unavailable, f'{client.srv_name} unavailable')
+            done = threading.Event()
+            holder = {}
+            future = client.call_async(request)
+            def complete(result):
+                # Callback records the outcome; the transition worker reports failures.
+                try:
+                    holder['result'] = result.result()
+                except Exception as exc:
+                    holder['error'] = exc
+                done.set()
+            future.add_done_callback(complete)
+            if not done.wait(timeout):
+                future.cancel()
+                raise MapFailure(unavailable, f'{client.srv_name} response timeout')
+            if holder.get('result') is None:
+                raise MapFailure(unavailable, f'{client.srv_name} call failed: {holder.get("error")}')
+            return holder['result']
+        finally:
+            if temporary_client is not None:
+                self.destroy_client(temporary_client)
 
     def fire_set_bool(self, client, value):
         if client.service_is_ready():
