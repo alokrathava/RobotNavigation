@@ -1844,12 +1844,14 @@ class RobotGatewayNode(Node):
         return os.path.join(map_dir, "locations.json")
 
     def _load_saved_locations(self, map_id: str) -> List[Dict[str, Any]]:
+        """Read destinations, interpreting legacy records in their established map frame."""
         path = self._locations_file_path(map_id)
         if path is None or not os.path.exists(path):
             return []
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                return [dict(location, frame=location.get("frame", "map"))
+                        for location in json.load(f)]
         except Exception:
             LOGGER.warning("Unreadable locations file %s; treating as empty", path)
             return []
@@ -1892,6 +1894,7 @@ class RobotGatewayNode(Node):
         await ws.send(safe_dumps(resp))
 
     async def handle_save_location(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
+        """Persist a finite map-frame destination only while its map is active and stable."""
         name = payload.get("name", "").strip()
         pose = payload.get("pose", {})
         if not name:
@@ -1903,6 +1906,15 @@ class RobotGatewayNode(Node):
             return
         if not is_valid_map_id(map_id):
             await self.send_error(ws, msg_id, "INVALID_MAP_ID", "Map ID is invalid or contains path traversal attempt")
+            return
+
+        if (not self.last_map_state or self.last_map_state.get("state") != "ACTIVE"
+                or map_id != self._active_map_id()):
+            await self.send_error(ws, msg_id, "MAP_NOT_ACTIVE", "Save requires the current active map without a transition")
+            return
+        frame = payload.get("frame", "map")
+        if frame != "map":
+            await self.send_error(ws, msg_id, "INVALID_FRAME", "Saved destinations must use the map frame")
             return
 
         try:
@@ -1920,6 +1932,7 @@ class RobotGatewayNode(Node):
             "id": f"loc_{uuid.uuid4().hex[:8]}",
             "name": name,
             "mapId": map_id,
+            "frame": frame,
             "xMeters": x,
             "yMeters": y,
             "yawRadians": yaw
@@ -1990,6 +2003,7 @@ class RobotGatewayNode(Node):
             await self.send_error(ws, msg_id, "LOCATION_NOT_FOUND", f"Saved location '{loc_id}' not found")
 
     async def handle_navigate_to_location(self, ws: ServerConnection, msg_id: str | None, payload: Dict[str, Any]):
+        """Resolve a saved ID on the active map and preserve its frame and orientation."""
         loc_id = payload.get("id", "")
         map_id = await self._require_active_map(ws, msg_id)
         if not map_id:
@@ -1999,6 +2013,10 @@ class RobotGatewayNode(Node):
         target_loc = next((loc for loc in locations if loc.get("id") == loc_id), None)
         if not target_loc:
             await self.send_error(ws, msg_id, "LOCATION_NOT_FOUND", f"Saved location '{loc_id}' not found")
+            return
+
+        if target_loc.get("frame", "map") != "map":
+            await self.send_error(ws, msg_id, "INVALID_FRAME", "Saved destination is not in the map frame")
             return
 
         nav_payload = {
